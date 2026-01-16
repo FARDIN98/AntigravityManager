@@ -5,6 +5,23 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.0] - 2026-01-16
+
+### New Features
+- Enhanced cloudHandler to inject minimal auth state when database entry is missing, improving onboarding reliability.
+- Implemented stability fixes and enhanced error handling across the application.
+
+### Improvements
+- Upgraded Electron from 32.3.3 to 37.3.1 for improved performance and security.
+- Conditionally include plugins based on start command in forge.config.ts for better build flexibility.
+
+### Bug Fixes
+- Fixed "Converting circular structure to JSON" error.
+
+### Documentation
+- Added curly brace constraints for conditional statements.
+- Fixed incorrect reference documentation name.
+
 ## [0.1.1] - 2026-01-11
 
 ### Bug Fixes
