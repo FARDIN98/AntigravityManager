@@ -1,61 +1,131 @@
 import { exec, execSync } from 'child_process';
 import { promisify } from 'util';
+import findProcess from 'find-process';
 import { getAntigravityExecutablePath, isWsl } from '../../utils/paths';
 import { logger } from '../../utils/logger';
 
 const execAsync = promisify(exec);
 
 /**
+ * Helper process name patterns to exclude (Electron helper processes)
+ */
+const HELPER_PATTERNS = [
+  'helper',
+  'plugin',
+  'renderer',
+  'gpu',
+  'crashpad',
+  'utility',
+  'audio',
+  'sandbox',
+  'language_server',
+];
+
+/**
+ * Check if a process is a helper/auxiliary process that should be excluded.
+ * @param name Process name (lowercase)
+ * @param cmd Process command line (lowercase)
+ * @returns True if the process is a helper process
+ */
+function isHelperProcess(name: string, cmd: string): boolean {
+  const nameLower = name.toLowerCase();
+  const cmdLower = cmd.toLowerCase();
+
+  // Check for --type= argument (Electron helper process indicator)
+  if (cmdLower.includes('--type=')) {
+    return true;
+  }
+
+  // Check for helper patterns in process name
+  for (const pattern of HELPER_PATTERNS) {
+    if (nameLower.includes(pattern)) {
+      return true;
+    }
+  }
+
+  // Check for crashpad in path
+  if (cmdLower.includes('crashpad')) {
+    return true;
+  }
+
+  return false;
+}
+
+/**
  * Checks if the Antigravity process is running.
+ * Uses find-process package for robust cross-platform process detection.
  * @returns {boolean} True if the Antigravity process is running, false otherwise.
  */
 export async function isProcessRunning(): Promise<boolean> {
   try {
     const platform = process.platform;
-    let command = '';
+    const currentPid = process.pid;
 
-    if (platform === 'win32' || isWsl()) {
-      // Use absolute path for tasklist to be safe on Windows too
-      const cmd = isWsl()
-        ? '/mnt/c/Windows/System32/tasklist.exe'
-        : process.env.SystemRoot // Usually C:\Windows
-          ? `${process.env.SystemRoot}\\System32\\tasklist.exe`
-          : 'tasklist';
+    // Use find-process to search for Antigravity processes
+    // 'name' search type matches process name
+    const processes = await findProcess('name', 'Antigravity', true);
 
-      command = `${cmd} /FI "IMAGENAME eq Antigravity.exe" /NH`;
-    } else {
-      // macOS and Linux (native)
-      command = 'pgrep -xi Antigravity';
-    }
+    logger.debug(`Found ${processes.length} processes matching 'Antigravity'`);
 
-    logger.debug(`Checking process with command: ${command}`);
-    // Increased timeout to 4000ms to avoid flakiness with tasklist/wmic
-    try {
-      const { stdout } = await execAsync(command, { timeout: 4000 });
-      if (platform === 'win32' || isWsl()) {
-        return stdout.includes('Antigravity.exe');
-      } else {
-        // pgrep returns PIDs if found, empty if not
-        return stdout.trim().length > 0;
+    for (const proc of processes) {
+      // Skip self
+      if (proc.pid === currentPid) {
+        continue;
       }
-    } catch (cmdError) {
-      if (platform === 'win32' && !isWsl()) {
-        logger.warn('tasklist failed, trying wmic fallback...', cmdError);
-        // Fallback to wmic (filtered)
-        try {
-          const wmicCmd = 'wmic process where "name=\'Antigravity.exe\'" get ProcessId';
-          const { stdout } = await execAsync(wmicCmd, { timeout: 4000 });
-          return stdout.includes('ProcessId');
-        } catch (wmicError) {
-          logger.error('wmic fallback also failed', wmicError);
-          return false;
+
+      const name = proc.name?.toLowerCase() || '';
+      const cmd = proc.cmd?.toLowerCase() || '';
+
+      // Skip manager process
+      if (
+        name.includes('manager') ||
+        cmd.includes('manager') ||
+        cmd.includes('antigravity-manager')
+      ) {
+        continue;
+      }
+
+      // Skip helper processes
+      if (isHelperProcess(name, cmd)) {
+        continue;
+      }
+
+      if (platform === 'darwin') {
+        // macOS: Check for Antigravity.app in path
+        if (cmd.includes('antigravity.app')) {
+          logger.debug(
+            `Found Antigravity process: PID=${proc.pid}, name=${name}, cmd=${cmd.substring(0, 100)}`,
+          );
+          return true;
+        }
+        // Also check if the process name is exactly 'Antigravity' (main process)
+        if (name === 'antigravity' && !isHelperProcess(name, cmd)) {
+          logger.debug(`Found Antigravity process: PID=${proc.pid}, name=${name}`);
+          return true;
+        }
+      } else if (platform === 'win32') {
+        // Windows: Check for Antigravity.exe
+        if (name === 'antigravity.exe' || name === 'antigravity') {
+          logger.debug(`Found Antigravity process: PID=${proc.pid}, name=${name}`);
+          return true;
+        }
+      } else {
+        // Linux: Check for antigravity in name or path (but not tools)
+        if (
+          (name.includes('antigravity') || cmd.includes('/antigravity')) &&
+          !name.includes('tools')
+        ) {
+          logger.debug(
+            `Found Antigravity process: PID=${proc.pid}, name=${name}, cmd=${cmd.substring(0, 100)}`,
+          );
+          return true;
         }
       }
-      throw cmdError;
     }
+
+    return false;
   } catch (error) {
-    logger.error('Error checking process status:', error);
-    // pgrep returns exit code 1 if no process found
+    logger.error('Error checking process status with find-process:', error);
     return false;
   }
 }

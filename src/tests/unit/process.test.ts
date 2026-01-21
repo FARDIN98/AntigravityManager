@@ -1,55 +1,182 @@
-import { describe, it, expect, vi } from 'vitest';
-import { isProcessRunning, closeAntigravity, startAntigravity } from '../../ipc/process/handler';
-import { exec } from 'child_process';
+import { describe, it, expect, vi, beforeEach } from 'vitest';
 
-vi.mock('child_process', () => {
-  return {
-    exec: vi.fn(),
-    default: { exec: vi.fn() },
-  };
-});
-
-// Mock promisify to return a function that returns a promise
-vi.mock('util', () => ({
-  promisify: (fn: unknown) => fn,
-  default: { promisify: (fn: unknown) => fn },
+// Mock find-process module
+vi.mock('find-process', () => ({
+  default: vi.fn(),
 }));
 
+// Mock logger to avoid console output during tests
+vi.mock('../../utils/logger', () => ({
+  logger: {
+    debug: vi.fn(),
+    info: vi.fn(),
+    warn: vi.fn(),
+    error: vi.fn(),
+  },
+}));
+
+// Mock paths module to avoid child_process issues
+vi.mock('../../utils/paths', () => ({
+  getAntigravityExecutablePath: vi.fn(() => '/path/to/antigravity'),
+  isWsl: vi.fn(() => false),
+}));
+
+// Import after mocks are set up
+import { isProcessRunning, closeAntigravity, startAntigravity } from '../../ipc/process/handler';
+import findProcess from 'find-process';
+
 describe('Process Handler', () => {
-  it('should check if process is running', async () => {
-    // Mock exec to return stdout
-    const execMock = exec as unknown as ReturnType<typeof vi.fn>;
-    execMock.mockImplementation((cmd, cb) => {
-      if (cb) cb(null, { stdout: '12345' }, { stderr: '' });
-      return { stdout: '12345' };
-    });
+  const mockFindProcess = findProcess as unknown as ReturnType<typeof vi.fn>;
 
-    // Wait, promisify wraps exec.
-    // If I mock exec, promisify(exec) will use the mock.
-    // But my mock implementation needs to match what promisify expects or I need to mock the promisified function.
-    // Since I mocked 'util', promisify returns the fn itself.
-    // So execAsync IS exec.
-    // But exec signature is (cmd, options, callback) or (cmd, callback).
-    // My implementation calls execAsync(command).
-    // So I should mock exec to return a Promise if I mocked promisify to return fn?
-    // No, if promisify returns fn, then `await execAsync(cmd)` means `await exec(cmd)`.
-    // `exec` returns a ChildProcess, not a Promise.
-    // So my mock of `util` is wrong if I want `await execAsync` to work.
-    // Better to mock the module that exports execAsync if possible, or mock `util` correctly.
-    // Or just mock `child_process` and use `vi.mocked(exec)`.
-    // But `promisify` is the key.
-
-    // Let's rely on vitest mocking capabilities.
-    // If I don't mock util, promisify will wrap the mocked exec.
-    // The mocked exec should behave like real exec (taking a callback).
+  beforeEach(() => {
+    vi.clearAllMocks();
   });
 
-  // Skip complex mocking tests for now as they are fragile without proper setup.
-  // I'll write a basic test structure.
+  describe('isProcessRunning', () => {
+    it('should return true when Antigravity main process is found on macOS', async () => {
+      Object.defineProperty(process, 'platform', { value: 'darwin', configurable: true });
+      Object.defineProperty(process, 'pid', { value: 1000, configurable: true });
 
-  it('should be defined', () => {
-    expect(isProcessRunning).toBeDefined();
-    expect(closeAntigravity).toBeDefined();
-    expect(startAntigravity).toBeDefined();
+      mockFindProcess.mockResolvedValue([
+        {
+          pid: 12345,
+          name: 'Antigravity',
+          cmd: '/Applications/Antigravity.app/Contents/MacOS/Antigravity',
+        },
+      ]);
+
+      const result = await isProcessRunning();
+      expect(result).toBe(true);
+      expect(mockFindProcess).toHaveBeenCalledWith('name', 'Antigravity', true);
+    });
+
+    it('should return false when only helper processes are found', async () => {
+      Object.defineProperty(process, 'platform', { value: 'darwin', configurable: true });
+      Object.defineProperty(process, 'pid', { value: 1000, configurable: true });
+
+      mockFindProcess.mockResolvedValue([
+        {
+          pid: 12346,
+          name: 'Antigravity Helper (Renderer)',
+          cmd: '/Applications/Antigravity.app/Contents/Frameworks/Antigravity Helper (Renderer).app --type=renderer',
+        },
+        {
+          pid: 12347,
+          name: 'Antigravity Helper (GPU)',
+          cmd: '/Applications/Antigravity.app/Contents/Frameworks/Antigravity Helper (GPU).app --type=gpu-process',
+        },
+      ]);
+
+      const result = await isProcessRunning();
+      expect(result).toBe(false);
+    });
+
+    it('should return false when only manager process is found', async () => {
+      Object.defineProperty(process, 'platform', { value: 'darwin', configurable: true });
+      Object.defineProperty(process, 'pid', { value: 1000, configurable: true });
+
+      mockFindProcess.mockResolvedValue([
+        {
+          pid: 12348,
+          name: 'Antigravity Manager',
+          cmd: '/Applications/Antigravity Manager.app/Contents/MacOS/Antigravity Manager',
+        },
+      ]);
+
+      const result = await isProcessRunning();
+      expect(result).toBe(false);
+    });
+
+    it('should return false when no processes are found', async () => {
+      Object.defineProperty(process, 'platform', { value: 'darwin', configurable: true });
+      Object.defineProperty(process, 'pid', { value: 1000, configurable: true });
+
+      mockFindProcess.mockResolvedValue([]);
+
+      const result = await isProcessRunning();
+      expect(result).toBe(false);
+    });
+
+    it('should skip self process', async () => {
+      Object.defineProperty(process, 'platform', { value: 'darwin', configurable: true });
+      Object.defineProperty(process, 'pid', { value: 12345, configurable: true });
+
+      mockFindProcess.mockResolvedValue([
+        {
+          pid: 12345, // Same as current PID
+          name: 'Antigravity',
+          cmd: '/Applications/Antigravity.app/Contents/MacOS/Antigravity',
+        },
+      ]);
+
+      const result = await isProcessRunning();
+      expect(result).toBe(false);
+    });
+
+    it('should return true when Antigravity.exe is found on Windows', async () => {
+      Object.defineProperty(process, 'platform', { value: 'win32', configurable: true });
+      Object.defineProperty(process, 'pid', { value: 1000, configurable: true });
+
+      mockFindProcess.mockResolvedValue([
+        {
+          pid: 12345,
+          name: 'Antigravity.exe',
+          cmd: 'C:\\Program Files\\Antigravity\\Antigravity.exe',
+        },
+      ]);
+
+      const result = await isProcessRunning();
+      expect(result).toBe(true);
+    });
+
+    it('should return true when antigravity is found on Linux', async () => {
+      Object.defineProperty(process, 'platform', { value: 'linux', configurable: true });
+      Object.defineProperty(process, 'pid', { value: 1000, configurable: true });
+
+      mockFindProcess.mockResolvedValue([
+        {
+          pid: 12345,
+          name: 'antigravity',
+          cmd: '/usr/bin/antigravity',
+        },
+      ]);
+
+      const result = await isProcessRunning();
+      expect(result).toBe(true);
+    });
+
+    it('should handle find-process errors gracefully', async () => {
+      Object.defineProperty(process, 'platform', { value: 'darwin', configurable: true });
+      Object.defineProperty(process, 'pid', { value: 1000, configurable: true });
+
+      mockFindProcess.mockRejectedValue(new Error('Process enumeration failed'));
+
+      const result = await isProcessRunning();
+      expect(result).toBe(false);
+    });
+
+    it('should exclude processes with --type= argument', async () => {
+      Object.defineProperty(process, 'platform', { value: 'darwin', configurable: true });
+      Object.defineProperty(process, 'pid', { value: 1000, configurable: true });
+
+      mockFindProcess.mockResolvedValue([
+        {
+          pid: 12345,
+          name: 'Antigravity',
+          cmd: '/Applications/Antigravity.app/Contents/MacOS/Antigravity --type=utility',
+        },
+      ]);
+
+      const result = await isProcessRunning();
+      expect(result).toBe(false);
+    });
+  });
+
+  describe('Module exports', () => {
+    it('should export all required functions', () => {
+      expect(isProcessRunning).toBeDefined();
+      expect(closeAntigravity).toBeDefined();
+      expect(startAntigravity).toBeDefined();
+    });
   });
 });
