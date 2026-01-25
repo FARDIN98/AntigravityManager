@@ -34,6 +34,13 @@
 </p>
 
 <p align="center">
+  <strong>🧪 内测版：</strong>
+  <a href="https://github.com/Draculabo/AntigravityManager/releases/tag/v0.3.3-beta.1">
+    下载 pre-release v0.3.3-beta.1
+  </a>
+</p>
+
+<p align="center">
   <img src="https://img.shields.io/badge/Electron-191970?style=for-the-badge&logo=Electron&logoColor=white" alt="Electron" />
   <img src="https://img.shields.io/badge/React-20232A?style=for-the-badge&logo=react&logoColor=61DAFB" alt="React" />
   <img src="https://img.shields.io/badge/TypeScript-007ACC?style=for-the-badge&logo=typescript&logoColor=white" alt="TypeScript" />
