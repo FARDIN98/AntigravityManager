@@ -3,6 +3,7 @@ import * as Sentry from '@sentry/electron/main';
 import path from 'path';
 import fs from 'fs';
 import { getAppDataDir } from './utils/paths';
+import { logger } from './utils/logger';
 
 function getQuickConfig() {
   try {
@@ -33,4 +34,27 @@ if (getQuickConfig()) {
       return event;
     },
   });
+  logger.setErrorReportingEnabled(true);
+  logger.setSentryReporter((payload) => {
+    Sentry.withScope((scope) => {
+      scope.setTag('log_level', payload.level);
+      scope.setContext('recent_logs', {
+        entries: payload.logs.map((entry) => ({
+          timestamp: new Date(entry.timestamp).toISOString(),
+          level: entry.level,
+          message: entry.message,
+          formatted: entry.formatted,
+        })),
+      });
+      scope.setExtra('log_message', payload.message);
+      if (payload.error) {
+        Sentry.captureException(payload.error);
+        return;
+      }
+      Sentry.captureMessage(payload.message, 'error');
+    });
+  });
+} else {
+  logger.setErrorReportingEnabled(false);
+  logger.setSentryReporter(null);
 }
