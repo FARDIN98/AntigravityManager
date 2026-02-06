@@ -1,41 +1,41 @@
-# 提案：应用本地化（自动检测系统语言）
+# Proposal: App Localization (Automatic System Language Detection)
 
-**变更 ID：** `localize-app-auto-detect`
+**Change ID:** `localize-app-auto-detect`
 
-## 摘要
+## Summary
 
-为 Antigravity Manager 应用添加多语言支持，并根据用户的操作系统语言自动设置默认语言。如果系统语言不受支持，则回退到英语。这包括更新 i18n 配置，添加中文翻译资源，并集成语言检测插件。
+Add multilingual support to Antigravity Manager and automatically set the default UI language based on the user's OS language. If the OS language is unsupported, fall back to English. This includes updating i18n configuration, adding Chinese translation resources, and integrating a language detection plugin.
 
-## 动机
+## Motivation
 
-为了提供最佳的用户体验，应用应该能够适应用户的首选语言环境。自动检测系统语言可以减少用户的配置步骤，提供更自然的初次使用体验。
+To provide a better user experience, the app should adapt to users' preferred language environment. Automatically detecting system language reduces setup effort and improves first-run experience.
 
-## 建议变更
+## Proposed Changes
 
-1. **集成语言检测：** 安装并配置 `i18next-browser-languagedetector` 以自动检测用户语言。
-2. **更新 i18n 配置：** 修改 `src/localization/i18n.ts`，启用语言检测，并设置适当的回退语言（英语）。
-3. **添加中文资源：** 为 `zh-CN` 创建一个新的翻译资源文件，包含所有应用字符串。
-4. **更新语言操作：** 确保 `src/actions/language.ts` 正确处理自动检测和手动覆盖的逻辑。
-5. **UI 更新：** 确保所有 UI 组件使用翻译键而不是硬编码字符串。
+1. **Integrate language detection:** Install and configure `i18next-browser-languagedetector` to auto-detect user language.
+2. **Update i18n config:** Modify `src/localization/i18n.ts` to enable language detection and define a fallback language (English).
+3. **Add Chinese resources:** Create `zh-CN` translation resources covering all app strings.
+4. **Update language actions:** Ensure `src/actions/language.ts` correctly handles auto-detection and manual override.
+5. **UI updates:** Ensure all UI components use translation keys instead of hardcoded text.
 
-## 考虑的替代方案
+## Alternatives Considered
 
-* **强制默认中文：** 已拒绝，为了适应更广泛的国际用户群体，并尊重用户的系统设置。
-* **强制默认英语：** 已拒绝，同上。
+* **Force default Chinese:** Rejected, to support a broader international user base and respect system settings.
+* **Force default English:** Rejected, same reason.
 
-## 风险
+## Risks
 
-* **检测失败：** 在某些特殊环境（如 Linux 某些发行版）下，语言检测可能不准确，需要确保回退机制可靠。
+* **Detection failure:** In certain environments (for example, some Linux distros), language detection may be inaccurate. Fallback behavior must remain reliable.
 
-## 验收标准
+## Acceptance Criteria
 
-1. **自动检测：**
-   * 在系统语言设置为中文（简体）的环境下启动应用，应用界面默认显示为中文。
-   * 在系统语言设置为英语或其他非中文语言的环境下启动应用，应用界面默认显示为英语。
-2. **手动切换：**
-   * 用户可以在设置页面将语言从中文切换到英语，界面应立即更新，无需重启。
-   * 用户可以在设置页面将语言从英语切换到中文，界面应立即更新，无需重启。
-3. **持久化：**
-   * 用户手动更改语言后，重启应用，应用应保持用户选择的语言，而不是重新检测系统语言。
-4. **完整性：**
-   * 应用的所有可见文本（包括主页、设置页、状态栏、弹窗提示）都应正确显示对应的语言，没有遗漏的硬编码字符串。
+1. **Automatic detection:**
+   * When OS language is Simplified Chinese, app defaults to Chinese on first launch.
+   * When OS language is English or another non-Chinese language, app defaults to English on first launch.
+2. **Manual switching:**
+   * Users can switch from Chinese to English in Settings, and UI updates immediately without restart.
+   * Users can switch from English to Chinese in Settings, and UI updates immediately without restart.
+3. **Persistence:**
+   * After users manually change language, app restart preserves the selected language instead of re-detecting.
+4. **Completeness:**
+   * All visible strings (home page, settings page, status bar, popups) render correctly in the selected language with no leftover hardcoded text.

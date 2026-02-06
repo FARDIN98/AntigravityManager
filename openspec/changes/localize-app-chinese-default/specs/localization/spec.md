@@ -1,59 +1,59 @@
-# 规格：本地化
+# Spec: Localization
 
 ## ADDED Requirements
 
-### Requirement: 自动语言检测
+### Requirement: Automatic Language Detection
 
-应用在首次启动时 MUST 自动检测用户的系统语言并设置相应的界面语言。
+On first launch, the application MUST automatically detect the user's system language and set the corresponding UI language.
 
-#### Scenario: 系统语言为中文
+#### Scenario: System language is Chinese
 
-Given 用户首次打开应用
-And 用户的系统语言设置为中文 (zh-CN)
-And 本地存储中没有保存语言偏好
-When 应用加载时
-Then 界面应该显示为简体中文 (`zh-CN`)
+Given the user opens the app for the first time
+And the user's system language is set to Chinese (`zh-CN`)
+And no language preference is saved in local storage
+When the app loads
+Then the UI should be displayed in Simplified Chinese (`zh-CN`)
 
-#### Scenario: 系统语言为其他（非中文）
+#### Scenario: System language is non-Chinese
 
-Given 用户首次打开应用
-And 用户的系统语言设置为法语 (fr)
-And 本地存储中没有保存语言偏好
-When 应用加载时
-Then 界面应该回退显示为英语 (`en`)
+Given the user opens the app for the first time
+And the user's system language is set to French (`fr`)
+And no language preference is saved in local storage
+When the app loads
+Then the UI should fall back to English (`en`)
 
-### Requirement: 语言切换
+### Requirement: Language Switching
 
-用户 MUST 能够在支持的语言之间切换，且手动选择 MUST 覆盖自动检测。
+Users MUST be able to switch between supported languages, and manual selection MUST override automatic detection.
 
-#### Scenario: 切换语言
+#### Scenario: Switch language
 
-Given 用户在设置页面
-When 用户从语言下拉菜单中选择 "English"
-Then 界面应该立即切换为英语
-And 偏好应该保存到本地存储
+Given the user is on the settings page
+When the user selects "English" from the language dropdown
+Then the UI should switch to English immediately
+And the preference should be saved to local storage
 
-### Requirement: 持久化
+### Requirement: Persistence
 
-用户的手动语言偏好 MUST 在会话之间持久化，并优先于系统语言。
+The user's manual language preference MUST persist across sessions and take precedence over system language.
 
-#### Scenario: 持久化语言偏好
+#### Scenario: Persist language preference
 
-Given 用户已手动选择 "English" 作为首选语言
-And 用户的系统语言设置为中文
-When 用户重启应用
-Then 界面应该显示为英语（尊重用户选择）
+Given the user has manually selected "English" as preferred language
+And the user's system language is Chinese
+When the user restarts the app
+Then the UI should display English (respecting user preference)
 
 ## MODIFIED Requirements
 
-### Requirement: i18n 配置更新
+### Requirement: Update i18n Configuration
 
-i18n 配置 MUST 更新以支持语言检测插件。
+i18n configuration MUST be updated to support the language detection plugin.
 
-#### Scenario: i18n 配置
+#### Scenario: i18n configuration
 
-`src/localization/i18n.ts` 文件必须更新为：
+`src/localization/i18n.ts` must be updated to:
 
-1. 集成 `i18next-browser-languagedetector`。
-2. 配置检测顺序：`['localStorage', 'navigator']`。
-3. 包含 `zh-CN` 资源对象。
+1. Integrate `i18next-browser-languagedetector`.
+2. Configure detection order as `['localStorage', 'navigator']`.
+3. Include `zh-CN` resource objects.
