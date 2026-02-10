@@ -1,6 +1,6 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { transformClaudeRequestIn } from '../lib/antigravity/ClaudeRequestMapper';
-import { ClaudeRequest, GeminiInternalRequest } from '../lib/antigravity/types';
+import { ClaudeRequest } from '../lib/antigravity/types';
 import { SignatureStore } from '../lib/antigravity/SignatureStore';
 
 /**
