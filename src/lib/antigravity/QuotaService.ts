@@ -1,5 +1,5 @@
-import axios, { AxiosError, AxiosInstance } from 'axios';
-import { QuotaData, Tier, LoadProjectResponse, QuotaApiResponse } from './types';
+import axios, { AxiosInstance } from 'axios';
+import { QuotaData, LoadProjectResponse, QuotaApiResponse } from './types';
 import { logger } from '../../utils/logger';
 
 // Constants

@@ -1,6 +1,6 @@
 import path from 'path';
 import fs from 'fs';
-import { AppConfig, AppConfigSchema, DEFAULT_APP_CONFIG } from '../../types/config';
+import { AppConfig, DEFAULT_APP_CONFIG } from '../../types/config';
 import { getAppDataDir } from '../../utils/paths';
 import { logger } from '../../utils/logger';
 

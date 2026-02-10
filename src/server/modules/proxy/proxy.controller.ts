@@ -1,6 +1,5 @@
 import {
   Controller,
-  Get,
   Post,
   Body,
   Res,
@@ -23,12 +22,8 @@ import {
   GeminiResponse,
 } from './interfaces/request-interfaces';
 import { ProxyGuard } from './proxy.guard';
-import {
-  getAllDynamicModels,
-  MODEL_LIST_CREATED_AT,
-  MODEL_LIST_OWNER,
-} from '../../../lib/antigravity/ModelMapping';
-import { getServerConfig } from '../../server-config';
+
+
 
 @Controller('v1')
 @UseGuards(ProxyGuard)
