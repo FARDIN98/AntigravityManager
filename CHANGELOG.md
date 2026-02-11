@@ -2,6 +2,12 @@
 
 # Changelog
 
+## [0.9.1](https://github.com/Draculabo/AntigravityManager/compare/v0.9.0...v0.9.1) (2026-02-11)
+
+### 🐛 Bug Fixes
+
+* project id forwarding regression ([#93](https://github.com/Draculabo/AntigravityManager/issues/93)) ([ab78d93](https://github.com/Draculabo/AntigravityManager/commit/ab78d9325213623067b5bd867b35464cd4eefd73))
+
 ## [0.9.0](https://github.com/Draculabo/AntigravityManager/compare/v0.8.0...v0.9.0) (2026-02-10)
 
 ### ✨ Features
