@@ -2,6 +2,12 @@
 
 # Changelog
 
+## [0.9.2](https://github.com/Draculabo/AntigravityManager/compare/v0.9.1...v0.9.2) (2026-02-11)
+
+### 🐛 Bug Fixes
+
+* project id fallback and stream error regression ([#94](https://github.com/Draculabo/AntigravityManager/issues/94)) ([caf9d58](https://github.com/Draculabo/AntigravityManager/commit/caf9d5849ac86f4c83cb7b33804b873e0c2ff545))
+
 ## [0.9.1](https://github.com/Draculabo/AntigravityManager/compare/v0.9.0...v0.9.1) (2026-02-11)
 
 ### 🐛 Bug Fixes
