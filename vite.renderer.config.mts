@@ -8,6 +8,7 @@ import { sentryVitePlugin } from '@sentry/vite-plugin';
 
 export default defineConfig(({ mode }) => {
   const env = loadEnv(mode, process.cwd(), '');
+  const isDev = mode === 'development';
 
   return {
     plugins: [
@@ -27,6 +28,7 @@ export default defineConfig(({ mode }) => {
             return source.replace(/^app:\/\/\//, '~/');
           },
         },
+        disable: isDev, // Disable in development to save memory
       }),
       tanstackRouter({
         target: 'react',
@@ -47,6 +49,35 @@ export default defineConfig(({ mode }) => {
       preserveSymlinks: true,
       alias: {
         '@': path.resolve(process.cwd(), './src'),
+      },
+    },
+    build: {
+      // Reduce memory usage during build
+      chunkSizeWarningLimit: 1000,
+      rollupOptions: {
+        output: {
+          manualChunks: (id) => {
+            // Split large dependencies into separate chunks
+            if (id.includes('node_modules')) {
+              if (id.includes('@radix-ui')) {
+                return 'radix-ui';
+              }
+              if (id.includes('@tanstack')) {
+                return 'tanstack';
+              }
+              if (id.includes('react') || id.includes('react-dom')) {
+                return 'react-vendor';
+              }
+              return 'vendor';
+            }
+          },
+        },
+      },
+    },
+    server: {
+      // Optimize dev server for memory
+      hmr: {
+        overlay: true,
       },
     },
   };
