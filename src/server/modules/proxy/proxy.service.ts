@@ -1,5 +1,5 @@
 import { Injectable, Logger, Inject } from '@nestjs/common';
-import { isEmpty, isNil } from 'lodash-es';
+import { isEmpty, isNil, isPlainObject, isString } from 'lodash-es';
 import { TokenManagerService } from './token-manager.service';
 import { GeminiClient } from './clients/gemini.client';
 import { v4 as uuidv4 } from 'uuid';
@@ -14,6 +14,7 @@ import {
   GeminiPart as InternalGeminiPart,
 } from '../../../lib/antigravity/types';
 import { calculateRetryDelay, sleep } from '../../../lib/antigravity/retry-utils';
+import { normalizeObjectJsonSchema } from '../../../lib/antigravity/JsonSchemaUtils';
 import {
   classifyStreamError,
   formatErrorForSSE,
@@ -28,12 +29,14 @@ import {
   AnthropicContent,
 } from './interfaces/request-interfaces';
 import { getServerConfig } from '../../server-config';
-import { resolveModelRoute } from '../../../lib/antigravity/ModelMapping';
+import { normalizeGeminiModelAlias, resolveModelRoute } from '../../../lib/antigravity/ModelMapping';
+import { getMaxOutputTokens, getThinkingBudget } from '../../../lib/antigravity/ModelSpecs';
+import { resolveRequestUserAgent } from './request-user-agent';
+import { UpstreamRequestError } from './clients/upstream-error';
 
 @Injectable()
 export class ProxyService {
   private readonly logger = new Logger(ProxyService.name);
-  private readonly defaultRequestUserAgent = 'antigravity/1.11.9 windows/amd64';
 
   constructor(
     @Inject(TokenManagerService) private readonly tokenManager: TokenManagerService,
@@ -45,12 +48,12 @@ export class ProxyService {
   async handleAnthropicMessages(
     request: AnthropicChatRequest,
   ): Promise<AnthropicChatResponse | Observable<string>> {
-    const sessionKey = this.getSessionKeyFromAnthropic(request);
+    const sessionKey = this.extractAnthropicSessionKey(request);
 
-    const targetModel = this.mapModel(request.model);
-    const extraHeaders = this.buildModelSpecificHeaders(request.model);
+    const targetModel = this.resolveTargetModel(request.model);
+    const extraHeaders = this.createModelSpecificHeaders(request.model);
     this.logger.log(
-      `Received Anthropic request for model: ${request.model} (Mapped: ${targetModel}, Stream: ${request.stream})`,
+      `Anthropic request received: model=${request.model}, mappedModel=${targetModel}, stream=${request.stream}`,
     );
 
     // Retry loop
@@ -61,13 +64,14 @@ export class ProxyService {
     for (let i = 0; i < maxRetries; i++) {
       if (i > 0) {
         const delay = calculateRetryDelay(i - 1);
-        this.logger.log(`Retry attempt ${i + 1}/${maxRetries}, waiting ${delay}ms (jittered)`);
+        this.logger.log(`Anthropic retry ${i + 1}/${maxRetries}, backoff=${delay}ms (jittered)`);
         await sleep(delay);
       }
 
       const token = await this.tokenManager.getNextToken({
         sessionKey,
         excludeAccountIds: Array.from(attemptedAccountIds),
+        model: targetModel,
       });
       if (!token) {
         throw new Error('No available accounts');
@@ -76,7 +80,13 @@ export class ProxyService {
 
       try {
         const projectId = token.token.project_id ?? '';
-        const geminiBody = transformClaudeRequestIn(this.toClaudeRequest(request), projectId);
+        const requestUserAgent = await resolveRequestUserAgent();
+        const geminiBody = transformClaudeRequestIn(
+          this.toClaudeRequest(request),
+          projectId,
+          requestUserAgent,
+        );
+        this.applyInternalGenerationConstraints(geminiBody, targetModel, token.id);
 
         if (request.stream) {
           const stream = await this.geminiClient.streamGenerateInternal(
@@ -101,7 +111,13 @@ export class ProxyService {
             `Anthropic request hit project context issue, retrying without project: ${error.message}`,
           );
           try {
-            const fallbackBody = transformClaudeRequestIn(this.toClaudeRequest(request), '');
+            const requestUserAgent = await resolveRequestUserAgent();
+            const fallbackBody = transformClaudeRequestIn(
+              this.toClaudeRequest(request),
+              '',
+              requestUserAgent,
+            );
+            this.applyInternalGenerationConstraints(fallbackBody, targetModel, token.id);
             if (request.stream) {
               const stream = await this.geminiClient.streamGenerateInternal(
                 fallbackBody,
@@ -126,17 +142,20 @@ export class ProxyService {
 
         if (error instanceof Error && this.isQuotaExhaustedError(error.message)) {
           this.logger.warn(
-            `Anthropic request hit quota exhaustion on mapped model, retrying with fallback model gemini-2.5-flash: ${error.message}`,
+            `Anthropic request hit quota exhaustion on mapped model, retrying with fallback model gemini-3-flash: ${error.message}`,
           );
           try {
             const downgradedRequest: ClaudeRequest = {
               ...this.toClaudeRequest(request),
-              model: 'gemini-2.5-flash',
+              model: 'gemini-3-flash',
             };
+            const requestUserAgent = await resolveRequestUserAgent();
             const downgradedBody = transformClaudeRequestIn(
               downgradedRequest,
               token.token.project_id ?? '',
+              requestUserAgent,
             );
+            this.applyInternalGenerationConstraints(downgradedBody, 'gemini-3-flash', token.id);
             if (request.stream) {
               const stream = await this.geminiClient.streamGenerateInternal(
                 downgradedBody,
@@ -164,17 +183,7 @@ export class ProxyService {
         }
 
         lastError = error;
-        if (error instanceof Error) {
-          this.logger.warn(`Anthropic Request failed: ${error.message}`);
-          const decision = this.classifyUpstreamError(error.message);
-          if (decision.retry) {
-            if (decision.markAsForbidden) {
-              this.tokenManager.markAsForbidden(token.id);
-            } else if (decision.markAsRateLimited) {
-              this.tokenManager.markAsRateLimited(token.id);
-            }
-          }
-        }
+        await this.applyUpstreamPenalty(token.id, targetModel, error);
       }
     }
     throw lastError || new Error('Request failed after retries');
@@ -182,7 +191,7 @@ export class ProxyService {
 
   private processAnthropicInternalStream(
     upstreamStream: NodeJS.ReadableStream,
-    model: string,
+    _model: string,
   ): Observable<string> {
     return new Observable<string>((subscriber) => {
       const decoder = new TextDecoder();
@@ -272,10 +281,10 @@ export class ProxyService {
     request: GeminiRequest,
   ): Promise<GeminiResponse> {
     const normalizedModel = this.normalizeGeminiModel(model);
-    const targetModel = this.mapModel(normalizedModel);
-    const extraHeaders = this.buildModelSpecificHeaders(normalizedModel);
+    const targetModel = this.resolveTargetModel(normalizedModel);
+    const extraHeaders = this.createModelSpecificHeaders(normalizedModel);
     this.logger.log(
-      `Received Gemini request for model: ${normalizedModel} (Mapped: ${targetModel})`,
+      `Gemini generate request received: model=${normalizedModel}, mappedModel=${targetModel}`,
     );
 
     let lastError: unknown = null;
@@ -291,6 +300,7 @@ export class ProxyService {
 
       const token = await this.tokenManager.getNextToken({
         excludeAccountIds: Array.from(attemptedAccountIds),
+        model: targetModel,
       });
       if (!token) {
         throw new Error('No available accounts (all exhausted or rate limited)');
@@ -298,12 +308,15 @@ export class ProxyService {
       attemptedAccountIds.add(token.id);
 
       try {
+        const requestUserAgent = await resolveRequestUserAgent();
         const internalBody = this.createGeminiInternalRequest(
           targetModel,
           request,
           token.token.project_id ?? '',
           'generate-content',
+          requestUserAgent,
         );
+        this.applyInternalGenerationConstraints(internalBody, targetModel, token.id);
 
         const response = await this.generateInternalWithStreamFallback(
           internalBody,
@@ -319,12 +332,15 @@ export class ProxyService {
             `Gemini request hit project context issue, retrying without project: ${err.message}`,
           );
           try {
+            const requestUserAgent = await resolveRequestUserAgent();
             const fallbackBody = this.createGeminiInternalRequest(
               targetModel,
               request,
               '',
               'generate-content',
+              requestUserAgent,
             );
+            this.applyInternalGenerationConstraints(fallbackBody, targetModel, token.id);
             const response = await this.generateInternalWithStreamFallback(
               fallbackBody,
               token.token.access_token,
@@ -339,17 +355,7 @@ export class ProxyService {
           lastError = err;
         }
 
-        if (lastError instanceof Error) {
-          this.logger.warn(`Gemini request failed with account ${token.email}: ${lastError.message}`);
-          const decision = this.classifyUpstreamError(lastError.message);
-          if (decision.retry) {
-            if (decision.markAsForbidden) {
-              this.tokenManager.markAsForbidden(token.id);
-            } else if (decision.markAsRateLimited) {
-              this.tokenManager.markAsRateLimited(token.id);
-            }
-          }
-        }
+        await this.applyUpstreamPenalty(token.id, targetModel, lastError);
       }
     }
 
@@ -361,10 +367,10 @@ export class ProxyService {
     request: GeminiRequest,
   ): Promise<Observable<string>> {
     const normalizedModel = this.normalizeGeminiModel(model);
-    const targetModel = this.mapModel(normalizedModel);
-    const extraHeaders = this.buildModelSpecificHeaders(normalizedModel);
+    const targetModel = this.resolveTargetModel(normalizedModel);
+    const extraHeaders = this.createModelSpecificHeaders(normalizedModel);
     this.logger.log(
-      `Received Gemini stream request for model: ${normalizedModel} (Mapped: ${targetModel})`,
+      `Gemini stream request received: model=${normalizedModel}, mappedModel=${targetModel}`,
     );
 
     let lastError: unknown = null;
@@ -380,6 +386,7 @@ export class ProxyService {
 
       const token = await this.tokenManager.getNextToken({
         excludeAccountIds: Array.from(attemptedAccountIds),
+        model: targetModel,
       });
       if (!token) {
         throw new Error('No available accounts (all exhausted or rate limited)');
@@ -387,12 +394,15 @@ export class ProxyService {
       attemptedAccountIds.add(token.id);
 
       try {
+        const requestUserAgent = await resolveRequestUserAgent();
         const internalBody = this.createGeminiInternalRequest(
           targetModel,
           request,
           token.token.project_id ?? '',
           'generate-content',
+          requestUserAgent,
         );
+        this.applyInternalGenerationConstraints(internalBody, targetModel, token.id);
 
         const stream = await this.geminiClient.streamGenerateInternal(
           internalBody,
@@ -407,12 +417,15 @@ export class ProxyService {
             `Gemini stream request hit project context issue, retrying without project: ${err.message}`,
           );
           try {
+            const requestUserAgent = await resolveRequestUserAgent();
             const fallbackBody = this.createGeminiInternalRequest(
               targetModel,
               request,
               '',
               'generate-content',
+              requestUserAgent,
             );
+            this.applyInternalGenerationConstraints(fallbackBody, targetModel, token.id);
             const stream = await this.geminiClient.streamGenerateInternal(
               fallbackBody,
               token.token.access_token,
@@ -427,19 +440,7 @@ export class ProxyService {
           lastError = err;
         }
 
-        if (lastError instanceof Error) {
-          this.logger.warn(
-            `Gemini stream request failed with account ${token.email}: ${lastError.message}`,
-          );
-          const decision = this.classifyUpstreamError(lastError.message);
-          if (decision.retry) {
-            if (decision.markAsForbidden) {
-              this.tokenManager.markAsForbidden(token.id);
-            } else if (decision.markAsRateLimited) {
-              this.tokenManager.markAsRateLimited(token.id);
-            }
-          }
-        }
+        await this.applyUpstreamPenalty(token.id, targetModel, lastError);
       }
     }
 
@@ -475,11 +476,130 @@ export class ProxyService {
     return model.replace(/^models\//i, '');
   }
 
+  private normalizeModelIdentifier(model: string): string {
+    return model.replace(/^models\//i, '').trim();
+  }
+
+  private resolveThinkingLevelBudget(level: string): number | undefined {
+    const normalized = level.trim().toUpperCase();
+    if (normalized === 'NONE') {
+      return 0;
+    }
+    if (normalized === 'LOW') {
+      return 4096;
+    }
+    if (normalized === 'MEDIUM') {
+      return 8192;
+    }
+    if (normalized === 'HIGH') {
+      return 24576;
+    }
+    return undefined;
+  }
+
+  private getModelOutputCap(accountId: string, model: string): number {
+    const normalizedModel = this.normalizeModelIdentifier(model);
+    const dynamicCap = this.tokenManager.getModelOutputLimitForAccount(accountId, normalizedModel);
+    if (typeof dynamicCap === 'number' && Number.isFinite(dynamicCap) && dynamicCap > 0) {
+      return Math.floor(dynamicCap);
+    }
+    return getMaxOutputTokens(normalizedModel);
+  }
+
+  private getModelThinkingBudget(accountId: string, model: string): number {
+    const normalizedModel = this.normalizeModelIdentifier(model);
+    const dynamicBudget = this.tokenManager.getModelThinkingBudgetForAccount(
+      accountId,
+      normalizedModel,
+    );
+    if (typeof dynamicBudget === 'number' && Number.isFinite(dynamicBudget) && dynamicBudget >= 0) {
+      return Math.floor(dynamicBudget);
+    }
+    return getThinkingBudget(normalizedModel);
+  }
+
+  private applyInternalGenerationConstraints(
+    body: GeminiInternalRequest,
+    model: string,
+    accountId: string,
+  ): void {
+    const generationConfig = body.request.generationConfig;
+    if (!generationConfig) {
+      return;
+    }
+
+    const outputCap = this.getModelOutputCap(accountId, model);
+    const thinkingBudgetCap = this.getModelThinkingBudget(accountId, model);
+    const normalizedModel = this.normalizeModelIdentifier(model).toLowerCase();
+    const isClaudeModel = normalizedModel.includes('claude');
+    const thinkingConfig = generationConfig.thinkingConfig as
+      | ({ thinkingLevel?: string; thinkingBudget?: number } & Record<string, unknown>)
+      | undefined;
+    const adaptiveSentinel =
+      thinkingConfig &&
+      (typeof thinkingConfig.thinkingLevel === 'string' ||
+        thinkingConfig.thinkingBudget === -1 ||
+        thinkingConfig.thinkingBudget === 32768);
+
+    if (thinkingConfig) {
+      if (!isClaudeModel && typeof thinkingConfig.thinkingLevel === 'string') {
+        const converted = this.resolveThinkingLevelBudget(thinkingConfig.thinkingLevel);
+        if (converted !== undefined) {
+          thinkingConfig.thinkingBudget = converted;
+        }
+        delete thinkingConfig.thinkingLevel;
+      }
+
+      if (typeof thinkingConfig.thinkingBudget === 'number' && thinkingConfig.thinkingBudget < 0) {
+        thinkingConfig.thinkingBudget = Math.min(thinkingBudgetCap, 24576);
+      }
+
+      if (
+        typeof thinkingConfig.thinkingBudget === 'number' &&
+        Number.isFinite(thinkingConfig.thinkingBudget)
+      ) {
+        thinkingConfig.thinkingBudget = Math.min(
+          Math.floor(thinkingConfig.thinkingBudget),
+          Math.max(0, outputCap - 1),
+          thinkingBudgetCap,
+        );
+
+        if (adaptiveSentinel) {
+          if (
+            generationConfig.maxOutputTokens === undefined ||
+            generationConfig.maxOutputTokens < 131072
+          ) {
+            generationConfig.maxOutputTokens = 131072;
+          }
+        } else if (
+          generationConfig.maxOutputTokens === undefined ||
+          generationConfig.maxOutputTokens <= thinkingConfig.thinkingBudget
+        ) {
+          const hasExplicitMax = generationConfig.maxOutputTokens !== undefined;
+          const overhead = hasExplicitMax ? 8192 : 32768;
+          const minRequired = Math.min(outputCap, thinkingConfig.thinkingBudget + overhead);
+          generationConfig.maxOutputTokens = minRequired;
+        }
+      }
+    }
+
+    if (
+      typeof generationConfig.maxOutputTokens === 'number' &&
+      Number.isFinite(generationConfig.maxOutputTokens)
+    ) {
+      generationConfig.maxOutputTokens = Math.min(
+        Math.floor(generationConfig.maxOutputTokens),
+        outputCap,
+      );
+    }
+  }
+
   private createGeminiInternalRequest(
     model: string,
     request: GeminiRequest,
     projectId: string | undefined,
     requestType: string,
+    requestUserAgent: string,
   ): GeminiInternalRequest {
     const normalizedProjectId = projectId?.trim();
 
@@ -487,7 +607,7 @@ export class ProxyService {
       requestId: uuidv4(),
       request: this.toInternalGeminiRequest(request),
       model,
-      userAgent: process.env.PROXY_REQUEST_USER_AGENT ?? this.defaultRequestUserAgent,
+      userAgent: requestUserAgent,
       requestType,
     };
 
@@ -523,9 +643,6 @@ export class ProxyService {
       if (usage.totalTokenCount !== undefined) {
         usageMetadata.totalTokenCount = usage.totalTokenCount;
       }
-      if (usage.thoughtsTokenCount !== undefined) {
-        usageMetadata.thoughtsTokenCount = usage.thoughtsTokenCount;
-      }
       if (usage.promptTokensDetails !== undefined) {
         usageMetadata.promptTokensDetails = usage.promptTokensDetails;
       }
@@ -546,12 +663,12 @@ export class ProxyService {
   async handleChatCompletions(
     request: OpenAIChatRequest,
   ): Promise<OpenAIChatResponse | Observable<string>> {
-    const sessionKey = this.getSessionKeyFromOpenAI(request);
+    const sessionKey = this.extractOpenAISessionKey(request);
 
-    const targetModel = this.mapModel(request.model);
-    const extraHeaders = this.buildModelSpecificHeaders(request.model);
+    const targetModel = this.resolveTargetModel(request.model);
+    const extraHeaders = this.createModelSpecificHeaders(request.model);
     this.logger.log(
-      `Received request for model: ${request.model} (Mapped: ${targetModel}, Stream: ${request.stream})`,
+      `OpenAI-compatible request received: model=${request.model}, mappedModel=${targetModel}, stream=${request.stream}`,
     );
 
     // Retry loop for account selection
@@ -562,7 +679,7 @@ export class ProxyService {
     for (let i = 0; i < maxRetries; i++) {
       if (i > 0) {
         const delay = calculateRetryDelay(i - 1);
-        this.logger.log(`Retry attempt ${i + 1}/${maxRetries}, waiting ${delay}ms (jittered)`);
+        this.logger.log(`OpenAI-compatible retry ${i + 1}/${maxRetries}, backoff=${delay}ms (jittered)`);
         await sleep(delay);
       }
 
@@ -570,6 +687,7 @@ export class ProxyService {
       const token = await this.tokenManager.getNextToken({
         sessionKey,
         excludeAccountIds: Array.from(attemptedAccountIds),
+        model: targetModel,
       });
       if (!token) {
         throw new Error('No available accounts (all exhausted or rate limited)');
@@ -579,7 +697,9 @@ export class ProxyService {
       try {
         const claudeRequest = this.convertOpenAIToClaude(request);
         const projectId = token.token.project_id ?? '';
-        const geminiBody = transformClaudeRequestIn(claudeRequest, projectId);
+        const requestUserAgent = await resolveRequestUserAgent();
+        const geminiBody = transformClaudeRequestIn(claudeRequest, projectId, requestUserAgent);
+        this.applyInternalGenerationConstraints(geminiBody, targetModel, token.id);
 
         // Use v1internal API (same as Anthropic handler)
         if (request.stream) {
@@ -593,7 +713,7 @@ export class ProxyService {
             return this.processStreamResponse(stream, request.model);
           } catch (streamError) {
             this.logger.warn(
-              `Stream request failed for ${request.model}, falling back to non-stream generation: ${
+              `Stream path failed for model=${request.model}; falling back to non-stream generation: ${
                 streamError instanceof Error ? streamError.message : String(streamError)
               }`,
             );
@@ -605,7 +725,7 @@ export class ProxyService {
               extraHeaders,
             );
             this.logger.log(
-              `Upstream response snippet (stream fallback): ${JSON.stringify(response).substring(0, 500)}`,
+              `Upstream response snippet after stream fallback: ${JSON.stringify(response).substring(0, 500)}`,
             );
             const claudeResponse = transformResponse(response);
             const openaiResponse = this.convertClaudeToOpenAIResponse(
@@ -622,11 +742,13 @@ export class ProxyService {
             extraHeaders,
           );
           this.logger.log(
-            `Upstream response snippet: ${JSON.stringify(response).substring(0, 500)}`,
+            `Upstream response snippet (non-stream): ${JSON.stringify(response).substring(0, 500)}`,
           );
           // Transform Gemini response to OpenAI format
           const claudeResponse = transformResponse(response);
-          this.logger.log(`Claude Response: ${JSON.stringify(claudeResponse).substring(0, 500)}`);
+          this.logger.log(
+            `Transformed Claude response snippet: ${JSON.stringify(claudeResponse).substring(0, 500)}`,
+          );
           return this.convertClaudeToOpenAIResponse(claudeResponse, request.model);
         }
       } catch (err) {
@@ -636,7 +758,9 @@ export class ProxyService {
           );
           try {
             const claudeRequest = this.convertOpenAIToClaude(request);
-            const fallbackBody = transformClaudeRequestIn(claudeRequest, '');
+            const requestUserAgent = await resolveRequestUserAgent();
+            const fallbackBody = transformClaudeRequestIn(claudeRequest, '', requestUserAgent);
+            this.applyInternalGenerationConstraints(fallbackBody, targetModel, token.id);
             if (request.stream) {
               const stream = await this.geminiClient.streamGenerateInternal(
                 fallbackBody,
@@ -662,18 +786,7 @@ export class ProxyService {
           lastError = err;
         }
 
-        if (lastError instanceof Error) {
-          this.logger.warn(`Request failed with account ${token.email}: ${lastError.message}`);
-
-          const decision = this.classifyUpstreamError(lastError.message);
-          if (decision.retry) {
-            if (decision.markAsForbidden) {
-              this.tokenManager.markAsForbidden(token.id);
-            } else if (decision.markAsRateLimited) {
-              this.tokenManager.markAsRateLimited(token.id);
-            }
-          }
-        }
+        await this.applyUpstreamPenalty(token.id, targetModel, lastError);
       }
     }
     throw lastError || new Error('Request failed after retries');
@@ -937,7 +1050,7 @@ export class ProxyService {
               hasSentDone = true;
               subscriber.complete();
             }
-          } catch (e) {
+          } catch {
             // ignore parse errors
           }
         }
@@ -1228,11 +1341,51 @@ export class ProxyService {
       return undefined;
     }
 
-    return tools.map((tool) => ({
-      name: tool.function.name,
-      description: tool.function.description,
-      input_schema: tool.function.parameters || { type: 'object', properties: {} },
-    }));
+    const result: NonNullable<AnthropicChatRequest['tools']> = [];
+    const searchToolTypes = new Set([
+      'web_search_20250305',
+      'google_search',
+      'google_search_retrieval',
+      'builtin_web_search',
+    ]);
+
+    for (const tool of tools) {
+      if (!tool) {
+        continue;
+      }
+
+      const toolType = isString(tool.type) ? tool.type.toLowerCase() : '';
+      const functionName = isString(tool.function?.name) ? tool.function.name : '';
+      const normalizedFunctionName = functionName.toLowerCase();
+      const isSearchTool =
+        searchToolTypes.has(toolType) || searchToolTypes.has(normalizedFunctionName);
+
+      if (isSearchTool) {
+        result.push({
+          name: functionName || 'builtin_web_search',
+          type: 'web_search_20250305',
+          input_schema: {
+            type: 'object',
+            properties: {},
+          },
+        });
+        continue;
+      }
+
+      if (!tool.function || !functionName) {
+        continue;
+      }
+
+      const inputSchema = normalizeObjectJsonSchema(tool.function.parameters);
+
+      result.push({
+        name: functionName,
+        description: tool.function.description,
+        input_schema: inputSchema,
+      });
+    }
+
+    return result.length > 0 ? result : undefined;
   }
 
   private mapGeminiFinishReasonToOpenAIFinishReason(finishReason?: string): string | null {
@@ -1362,7 +1515,7 @@ export class ProxyService {
     };
   }
 
-  private mapModel(model: string): string {
+  private resolveTargetModel(model: string): string {
     const normalizedModel = model.replace(/^models\//i, '').trim();
     const config = getServerConfig();
     const configuredMapping = {
@@ -1400,23 +1553,66 @@ export class ProxyService {
     }
 
     const routedModel = resolveModelRoute(normalizedModel, customExactMapping, {}, {});
-
-    return routedModel;
+    return normalizeGeminiModelAlias(routedModel);
   }
 
-  private classifyUpstreamError(errorMessage: string): {
+  private async applyUpstreamPenalty(
+    accountId: string,
+    model: string,
+    error: unknown,
+  ): Promise<void> {
+    this.tokenManager.recordParityError();
+
+    if (error instanceof UpstreamRequestError) {
+      const status = error.status;
+      if (status === 401 || status === 403) {
+        this.tokenManager.markAsForbidden(accountId);
+        return;
+      }
+
+      await this.tokenManager.markFromUpstreamError({
+        accountIdOrEmail: accountId,
+        status,
+        retryAfter: error.headers?.retryAfter,
+        body: error.body,
+        model,
+      });
+      return;
+    }
+
+    if (!(error instanceof Error)) {
+      return;
+    }
+
+    this.logger.warn(`Upstream request failed for account ${accountId}: ${error.message}`);
+    const penaltyDecision = this.classifyUpstreamFailure(error.message);
+    if (!penaltyDecision.retry) {
+      return;
+    }
+
+    if (penaltyDecision.markAsForbidden) {
+      this.tokenManager.markAsForbidden(accountId);
+      return;
+    }
+
+    if (penaltyDecision.markAsRateLimited) {
+      this.tokenManager.markAsRateLimited(accountId);
+    }
+  }
+
+  private classifyUpstreamFailure(errorMessage: string): {
     retry: boolean;
     markAsForbidden: boolean;
     markAsRateLimited: boolean;
   } {
-    const msg = errorMessage.toLowerCase();
+    const normalizedErrorMessage = errorMessage.toLowerCase();
     const isForbidden =
-      msg.includes('401') ||
-      msg.includes('unauthorized') ||
-      msg.includes('invalid_grant') ||
-      msg.includes('403') ||
-      msg.includes('permission_denied') ||
-      msg.includes('forbidden');
+      normalizedErrorMessage.includes('401') ||
+      normalizedErrorMessage.includes('unauthorized') ||
+      normalizedErrorMessage.includes('invalid_grant') ||
+      normalizedErrorMessage.includes('403') ||
+      normalizedErrorMessage.includes('permission_denied') ||
+      normalizedErrorMessage.includes('forbidden');
 
     if (isForbidden) {
       return {
@@ -1427,28 +1623,28 @@ export class ProxyService {
     }
 
     const isRateLimitedSignal =
-      msg.includes('429') ||
-      msg.includes('resource_exhausted') ||
-      msg.includes('quota') ||
-      msg.includes('rate_limit') ||
-      msg.includes('rate limit');
+      normalizedErrorMessage.includes('429') ||
+      normalizedErrorMessage.includes('resource_exhausted') ||
+      normalizedErrorMessage.includes('quota') ||
+      normalizedErrorMessage.includes('rate_limit') ||
+      normalizedErrorMessage.includes('rate limit');
 
     const shouldRetryByStatus =
-      msg.includes('408') ||
-      msg.includes('429') ||
-      msg.includes('500') ||
-      msg.includes('502') ||
-      msg.includes('503') ||
-      msg.includes('504');
+      normalizedErrorMessage.includes('408') ||
+      normalizedErrorMessage.includes('429') ||
+      normalizedErrorMessage.includes('500') ||
+      normalizedErrorMessage.includes('502') ||
+      normalizedErrorMessage.includes('503') ||
+      normalizedErrorMessage.includes('504');
 
     const shouldRetryByKeyword =
-      msg.includes('resource_exhausted') ||
-      msg.includes('quota') ||
-      msg.includes('rate_limit') ||
-      msg.includes('timeout') ||
-      msg.includes('socket hang up') ||
-      msg.includes('empty response stream') ||
-      msg.includes('connection reset');
+      normalizedErrorMessage.includes('resource_exhausted') ||
+      normalizedErrorMessage.includes('quota') ||
+      normalizedErrorMessage.includes('rate_limit') ||
+      normalizedErrorMessage.includes('timeout') ||
+      normalizedErrorMessage.includes('socket hang up') ||
+      normalizedErrorMessage.includes('empty response stream') ||
+      normalizedErrorMessage.includes('connection reset');
 
     if (shouldRetryByStatus || shouldRetryByKeyword) {
       return {
@@ -1465,7 +1661,7 @@ export class ProxyService {
     };
   }
 
-  private buildModelSpecificHeaders(model: string | undefined): Record<string, string> {
+  private createModelSpecificHeaders(model: string | undefined): Record<string, string> {
     if (!model) {
       return {};
     }
@@ -1510,28 +1706,28 @@ export class ProxyService {
     );
   }
 
-  private getSessionKeyFromAnthropic(request: AnthropicChatRequest): string | undefined {
+  private extractAnthropicSessionKey(request: AnthropicChatRequest): string | undefined {
     const metadata = request.metadata;
     const sessionCandidate =
       metadata?.session_id ?? metadata?.sessionId ?? metadata?.user_id ?? metadata?.userId;
-    if (typeof sessionCandidate !== 'string' || sessionCandidate.trim() === '') {
+    if (!isString(sessionCandidate) || sessionCandidate.trim() === '') {
       return undefined;
     }
     return `anthropic:${sessionCandidate.trim()}`;
   }
 
-  private getSessionKeyFromOpenAI(request: OpenAIChatRequest): string | undefined {
+  private extractOpenAISessionKey(request: OpenAIChatRequest): string | undefined {
     const extra = request.extra;
     const sessionCandidate =
       extra?.session_id ?? extra?.sessionId ?? extra?.user_id ?? extra?.userId;
-    if (typeof sessionCandidate !== 'string' || sessionCandidate.trim() === '') {
+    if (!isString(sessionCandidate) || sessionCandidate.trim() === '') {
       return undefined;
     }
     return `openai:${sessionCandidate.trim()}`;
   }
 
   private isRecord(value: unknown): value is Record<string, unknown> {
-    return value !== null && typeof value === 'object' && !Array.isArray(value);
+    return isPlainObject(value);
   }
 
   private isGeminiPart(value: unknown): value is InternalGeminiPart {

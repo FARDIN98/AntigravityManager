@@ -30,12 +30,13 @@ export interface OpenAIContentPart {
 }
 
 export interface OpenAITool {
-  type: 'function';
-  function: {
+  type: string;
+  function?: {
     name: string;
     description?: string;
     parameters?: Record<string, unknown>;
   };
+  [key: string]: unknown;
 }
 
 export interface OpenAIToolCall {

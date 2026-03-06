@@ -9,9 +9,10 @@ import {
   Inject,
   Req,
   Logger,
+  Optional,
 } from '@nestjs/common';
 import { FastifyReply, FastifyRequest } from 'fastify';
-import { isNil } from 'lodash-es';
+import { isNil, isPlainObject, isString } from 'lodash-es';
 import { ProxyService } from './proxy.service';
 import { Observable } from 'rxjs';
 import {
@@ -29,20 +30,27 @@ import {
   MODEL_LIST_OWNER,
 } from '../../../lib/antigravity/ModelMapping';
 import { getServerConfig } from '../../server-config';
+import { TokenManagerService } from './token-manager.service';
 
 @Controller('v1')
 @UseGuards(ProxyGuard)
 export class ProxyController {
   private readonly logger = new Logger(ProxyController.name);
 
-  constructor(@Inject(ProxyService) private readonly proxyService: ProxyService) {}
+  constructor(
+    @Inject(ProxyService) private readonly proxyService: ProxyService,
+    @Optional() @Inject(TokenManagerService) private readonly tokenManager?: TokenManagerService,
+  ) {}
 
   @Get('models')
   listModels(@Res() res: FastifyReply) {
     try {
       const config = getServerConfig();
       const customMapping = config?.custom_mapping ?? {};
-      const modelIds = getAllDynamicModels(customMapping);
+      const modelIds = getAllDynamicModels(
+        customMapping,
+        this.tokenManager?.getAllCollectedModels(),
+      );
 
       const data = modelIds.map((id) => ({
         id,
@@ -69,7 +77,7 @@ export class ProxyController {
 
   @Post('chat/completions')
   async chatCompletions(@Body() body: OpenAIChatRequest, @Res() res: FastifyReply) {
-    await this.sendOpenAIChatCompletionResponse(body, res);
+    await this.respondOpenAIChatCompletions(body, res);
   }
 
   @Post('completions')
@@ -86,11 +94,11 @@ export class ProxyController {
     @Res() res: FastifyReply,
   ) {
     const request: OpenAIChatRequest = {
-      model: body.model ?? 'gemini-2.5-flash',
+      model: body.model ?? 'gemini-3-flash',
       messages: [
         {
           role: 'user',
-          content: this.normalizePrompt(body.prompt),
+          content: this.normalizeCompletionPrompt(body.prompt),
         },
       ],
       max_tokens: body.max_tokens,
@@ -106,17 +114,9 @@ export class ProxyController {
       }
 
       const response = result as OpenAIChatResponse;
-      res.status(HttpStatus.OK).send(this.toLegacyCompletionsResponse(response));
+      res.status(HttpStatus.OK).send(this.toLegacyTextCompletionsResponse(response));
     } catch (error) {
-      const message = error instanceof Error ? error.message : 'Internal Server Error';
-      const status = this.resolveUpstreamStatus(message);
-      this.logEndpointError('/v1/completions', status, message, error);
-      res.status(status).send({
-        error: {
-          message,
-          type: 'server_error',
-        },
-      });
+      this.sendOpenAIErrorResponse(res, '/v1/completions', error);
     }
   }
 
@@ -127,6 +127,7 @@ export class ProxyController {
       model?: string;
       instructions?: string;
       input?: unknown;
+      tools?: OpenAIChatRequest['tools'];
       max_output_tokens?: number;
       temperature?: number;
       top_p?: number;
@@ -144,17 +145,9 @@ export class ProxyController {
       }
 
       const response = result as OpenAIChatResponse;
-      res.status(HttpStatus.OK).send(this.toLegacyCompletionsResponse(response));
+      res.status(HttpStatus.OK).send(this.toLegacyTextCompletionsResponse(response));
     } catch (error) {
-      const message = error instanceof Error ? error.message : 'Internal Server Error';
-      const status = this.resolveUpstreamStatus(message);
-      this.logEndpointError('/v1/responses', status, message, error);
-      res.status(status).send({
-        error: {
-          message,
-          type: 'server_error',
-        },
-      });
+      this.sendOpenAIErrorResponse(res, '/v1/responses', error);
     }
   }
 
@@ -182,7 +175,7 @@ export class ProxyController {
       quality: body.quality,
     };
 
-    await this.sendOpenAIImageResponse(request, body.prompt ?? '', res);
+    await this.sendOpenAIImageGenerationResponse(request, body.prompt ?? '', res);
   }
 
   @Post('images/edits')
@@ -200,7 +193,7 @@ export class ProxyController {
     @Req() req: FastifyRequest,
     @Res() res: FastifyReply,
   ) {
-    if (!this.hasValidMultipartBoundary(req)) {
+    if (!this.hasMultipartBoundary(req)) {
       res
         .status(HttpStatus.BAD_REQUEST)
         .send('Invalid `boundary` for `multipart/form-data` request');
@@ -236,7 +229,7 @@ export class ProxyController {
       quality: body.quality,
     };
 
-    await this.sendOpenAIImageResponse(request, body.prompt ?? '', res);
+    await this.sendOpenAIImageGenerationResponse(request, body.prompt ?? '', res);
   }
 
   @Post('audio/transcriptions')
@@ -251,7 +244,7 @@ export class ProxyController {
     @Req() req: FastifyRequest,
     @Res() res: FastifyReply,
   ) {
-    if (!this.hasValidMultipartBoundary(req)) {
+    if (!this.hasMultipartBoundary(req)) {
       res
         .status(HttpStatus.BAD_REQUEST)
         .send('Invalid `boundary` for `multipart/form-data` request');
@@ -271,7 +264,7 @@ export class ProxyController {
 
     try {
       const result = await this.proxyService.handleGeminiGenerateContent(
-        body.model ?? 'gemini-2.5-flash',
+        body.model ?? 'gemini-3-flash',
         {
           contents: [
             {
@@ -298,19 +291,11 @@ export class ProxyController {
         text: text ?? '',
       });
     } catch (error) {
-      const message = error instanceof Error ? error.message : 'Internal Server Error';
-      const status = this.resolveUpstreamStatus(message);
-      this.logEndpointError('/v1/audio/transcriptions', status, message, error);
-      res.status(status).send({
-        error: {
-          message,
-          type: 'server_error',
-        },
-      });
+      this.sendOpenAIErrorResponse(res, '/v1/audio/transcriptions', error);
     }
   }
 
-  private async sendOpenAIChatCompletionResponse(body: OpenAIChatRequest, res: FastifyReply) {
+  private async respondOpenAIChatCompletions(body: OpenAIChatRequest, res: FastifyReply) {
     try {
       const result = await this.proxyService.handleChatCompletions(body);
 
@@ -321,15 +306,7 @@ export class ProxyController {
         res.status(HttpStatus.OK).send(result);
       }
     } catch (error) {
-      const message = error instanceof Error ? error.message : 'Internal Server Error';
-      const status = this.resolveUpstreamStatus(message);
-      this.logEndpointError('/v1/chat/completions', status, message, error);
-      res.status(status).send({
-        error: {
-          message: message,
-          type: 'server_error',
-        },
-      });
+      this.sendOpenAIErrorResponse(res, '/v1/chat/completions', error);
     }
   }
 
@@ -345,20 +322,11 @@ export class ProxyController {
         res.status(HttpStatus.OK).send(result);
       }
     } catch (error) {
-      const message = error instanceof Error ? error.message : 'Internal Server Error';
-      const status = this.resolveUpstreamStatus(message);
-      this.logEndpointError('/v1/messages', status, message, error);
-      res.status(status).send({
-        type: 'error',
-        error: {
-          type: 'api_error',
-          message: message,
-        },
-      });
+      this.sendAnthropicErrorResponse(res, '/v1/messages', error);
     }
   }
 
-  private normalizePrompt(prompt: string | string[] | undefined): string {
+  private normalizeCompletionPrompt(prompt: string | string[] | undefined): string {
     if (!prompt) {
       return '';
     }
@@ -368,7 +336,7 @@ export class ProxyController {
     return prompt;
   }
 
-  private toLegacyCompletionsResponse(response: OpenAIChatResponse): Record<string, unknown> {
+  private toLegacyTextCompletionsResponse(response: OpenAIChatResponse): Record<string, unknown> {
     const choice = response.choices?.[0];
     const content = choice?.message?.content;
     const text = typeof content === 'string' ? content : '';
@@ -391,21 +359,20 @@ export class ProxyController {
   }
 
   private normalizeResponsesInput(input: unknown): string {
-    if (typeof input === 'string') {
+    if (isString(input)) {
       return input;
     }
 
     if (Array.isArray(input)) {
       return input
         .map((item) => {
-          if (typeof item === 'string') {
+          if (isString(item)) {
             return item;
           }
-          if (item && typeof item === 'object' && 'content' in item) {
-            const content = (item as { content?: unknown }).content;
-            if (typeof content === 'string') {
-              return content;
-            }
+          const itemRecord = this.toRecord(item);
+          const content = this.asString(itemRecord?.content);
+          if (content) {
+            return content;
           }
           return JSON.stringify(item);
         })
@@ -423,6 +390,7 @@ export class ProxyController {
     model?: string;
     instructions?: string;
     input?: unknown;
+    tools?: OpenAIChatRequest['tools'];
     max_output_tokens?: number;
     temperature?: number;
     top_p?: number;
@@ -458,7 +426,7 @@ export class ProxyController {
             type === 'local_shell_call'
               ? 'shell'
               : type === 'web_search_call'
-                ? 'google_search'
+                ? 'builtin_web_search'
                 : (this.asString(itemObj.name) ?? 'unknown');
           callIdToToolName.set(callId, toolName);
         }
@@ -536,8 +504,9 @@ export class ProxyController {
     }
 
     return {
-      model: body.model ?? 'gemini-2.5-flash',
+      model: body.model ?? 'gemini-3-flash',
       messages,
+      tools: body.tools,
       max_tokens: body.max_output_tokens,
       temperature: body.temperature,
       top_p: body.top_p,
@@ -546,7 +515,7 @@ export class ProxyController {
   }
 
   private normalizeResponsesMessageContent(content: unknown): string | OpenAIContentPart[] {
-    if (typeof content === 'string') {
+    if (isString(content)) {
       return content;
     }
 
@@ -621,11 +590,12 @@ export class ProxyController {
     }
 
     const raw = item.arguments;
-    if (typeof raw === 'string') {
+    if (isString(raw)) {
       try {
         const parsed = JSON.parse(raw);
-        if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
-          return parsed as Record<string, unknown>;
+        const parsedRecord = this.toRecord(parsed);
+        if (parsedRecord) {
+          return parsedRecord;
         }
         return {
           value: parsed,
@@ -637,23 +607,22 @@ export class ProxyController {
       }
     }
 
-    if (raw && typeof raw === 'object' && !Array.isArray(raw)) {
-      return raw as Record<string, unknown>;
+    const rawRecord = this.toRecord(raw);
+    if (rawRecord) {
+      return rawRecord;
     }
 
     return {};
   }
 
   private normalizeResponsesOutput(output: unknown): string {
-    if (typeof output === 'string') {
+    if (isString(output)) {
       return output;
     }
-    if (output && typeof output === 'object' && !Array.isArray(output)) {
-      const obj = output as Record<string, unknown>;
-      const content = this.asString(obj.content);
-      if (content) {
-        return content;
-      }
+    const outputRecord = this.toRecord(output);
+    const content = this.asString(outputRecord?.content);
+    if (content) {
+      return content;
     }
     if (isNil(output)) {
       return '';
@@ -663,15 +632,13 @@ export class ProxyController {
 
   private resolveImageUrl(block: Record<string, unknown>): string | null {
     const raw = block.image_url;
-    if (typeof raw === 'string') {
+    if (isString(raw)) {
       return raw;
     }
-    if (raw && typeof raw === 'object' && !Array.isArray(raw)) {
-      const record = raw as Record<string, unknown>;
-      const url = this.asString(record.url);
-      if (url) {
-        return url;
-      }
+    const rawRecord = this.toRecord(raw);
+    const url = this.asString(rawRecord?.url);
+    if (url) {
+      return url;
     }
     return null;
   }
@@ -703,7 +670,7 @@ export class ProxyController {
       return null;
     }
 
-    if (typeof input === 'string') {
+    if (isString(input)) {
       const dataUri = input.match(/^data:(?<mime>[^;]+);base64,(?<data>[A-Za-z0-9+/=]+)$/);
       if (dataUri?.groups?.mime && dataUri.groups.data) {
         return {
@@ -722,14 +689,14 @@ export class ProxyController {
       return null;
     }
 
-    if (typeof input === 'object' && !Array.isArray(input)) {
-      const obj = input as Record<string, unknown>;
-      const data = this.asString(obj.data);
+    const inputRecord = this.toRecord(input);
+    if (inputRecord) {
+      const data = this.asString(inputRecord.data);
       if (!data) {
         return null;
       }
       return {
-        mimeType: this.asString(obj.mimeType) ?? 'audio/mpeg',
+        mimeType: this.asString(inputRecord.mimeType) ?? 'audio/mpeg',
         data,
       };
     }
@@ -738,14 +705,14 @@ export class ProxyController {
   }
 
   private toRecord(value: unknown): Record<string, unknown> | null {
-    if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    if (!isPlainObject(value)) {
       return null;
     }
     return value as Record<string, unknown>;
   }
 
   private asString(value: unknown): string | null {
-    return typeof value === 'string' ? value : null;
+    return isString(value) ? value : null;
   }
 
   private isObservableLike(value: unknown): value is Observable<unknown> {
@@ -814,7 +781,7 @@ export class ProxyController {
     });
   }
 
-  private async sendOpenAIImageResponse(
+  private async sendOpenAIImageGenerationResponse(
     request: OpenAIChatRequest,
     prompt: string,
     res: FastifyReply,
@@ -822,7 +789,7 @@ export class ProxyController {
     try {
       const result = await this.proxyService.handleChatCompletions(request);
       if (result instanceof Observable) {
-        this.logEndpointError(
+        this.logProxyEndpointError(
           '/v1/images/generations',
           HttpStatus.INTERNAL_SERVER_ERROR,
           'Streaming image generation is not supported by this endpoint',
@@ -839,7 +806,7 @@ export class ProxyController {
       const content = result.choices?.[0]?.message?.content;
       const image = this.extractInlineBase64Image(typeof content === 'string' ? content : '');
       if (!image) {
-        this.logEndpointError(
+        this.logProxyEndpointError(
           '/v1/images/generations',
           HttpStatus.BAD_GATEWAY,
           'Upstream did not return inline image data',
@@ -889,14 +856,7 @@ export class ProxyController {
         }
       }
 
-      const status = this.resolveUpstreamStatus(message);
-      this.logEndpointError('/v1/images/generations', status, message, error);
-      res.status(status).send({
-        error: {
-          message,
-          type: 'server_error',
-        },
-      });
+      this.sendOpenAIErrorResponse(res, '/v1/images/generations', error, message);
     }
   }
 
@@ -1002,7 +962,7 @@ export class ProxyController {
     );
   }
 
-  private hasValidMultipartBoundary(req: FastifyRequest): boolean {
+  private hasMultipartBoundary(req: FastifyRequest): boolean {
     const contentType = req.headers['content-type'];
     if (typeof contentType !== 'string') {
       return false;
@@ -1012,7 +972,46 @@ export class ProxyController {
     return lowered.includes('multipart/form-data') && lowered.includes('boundary=');
   }
 
-  private resolveUpstreamStatus(message: string): HttpStatus {
+  private resolveErrorMessageText(error: unknown): string {
+    return error instanceof Error ? error.message : 'Internal Server Error';
+  }
+
+  private sendOpenAIErrorResponse(
+    res: FastifyReply,
+    endpoint: string,
+    error: unknown,
+    overrideMessage?: string,
+  ): void {
+    const message = overrideMessage ?? this.resolveErrorMessageText(error);
+    const status = this.resolveErrorHttpStatus(message);
+    this.logProxyEndpointError(endpoint, status, message, error);
+    res.status(status).send({
+      error: {
+        message,
+        type: 'server_error',
+      },
+    });
+  }
+
+  private sendAnthropicErrorResponse(
+    res: FastifyReply,
+    endpoint: string,
+    error: unknown,
+    overrideMessage?: string,
+  ): void {
+    const message = overrideMessage ?? this.resolveErrorMessageText(error);
+    const status = this.resolveErrorHttpStatus(message);
+    this.logProxyEndpointError(endpoint, status, message, error);
+    res.status(status).send({
+      type: 'error',
+      error: {
+        type: 'api_error',
+        message,
+      },
+    });
+  }
+
+  private resolveErrorHttpStatus(message: string): HttpStatus {
     const lowered = message.toLowerCase();
     if (lowered.includes('all accounts failed or unhealthy')) {
       return HttpStatus.SERVICE_UNAVAILABLE;
@@ -1050,7 +1049,7 @@ export class ProxyController {
     return HttpStatus.INTERNAL_SERVER_ERROR;
   }
 
-  private logEndpointError(
+  private logProxyEndpointError(
     endpoint: string,
     status: HttpStatus,
     message: string,

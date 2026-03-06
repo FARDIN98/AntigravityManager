@@ -8,6 +8,7 @@ import {
   Post,
   Res,
   UseGuards,
+  Optional,
 } from '@nestjs/common';
 import { FastifyReply } from 'fastify';
 import { isEmpty } from 'lodash-es';
@@ -18,6 +19,7 @@ import { ProxyService } from './proxy.service';
 import { GeminiRequest, GeminiResponse } from './interfaces/request-interfaces';
 import { getServerConfig } from '../../server-config';
 import { getAllDynamicModels } from '../../../lib/antigravity/ModelMapping';
+import { TokenManagerService } from './token-manager.service';
 
 type GeminiModelMetadata = {
   name: string;
@@ -35,7 +37,10 @@ type GeminiModelMetadata = {
 @Controller('v1beta')
 @UseGuards(ProxyGuard)
 export class GeminiController {
-  constructor(@Inject(ProxyService) private readonly proxyService: ProxyService) {}
+  constructor(
+    @Inject(ProxyService) private readonly proxyService: ProxyService,
+    @Optional() @Inject(TokenManagerService) private readonly tokenManager?: TokenManagerService,
+  ) {}
 
   @Get('models')
   listModels(@Res() res: FastifyReply) {
@@ -70,7 +75,7 @@ export class GeminiController {
     @Body() body: GeminiRequest,
     @Res() res: FastifyReply,
   ) {
-    const parsed = this.parseCombinedModelAction(modelAction);
+    const parsed = this.parseModelActionToken(modelAction);
     if (!parsed) {
       res.status(HttpStatus.BAD_REQUEST).send({
         error: {
@@ -82,7 +87,7 @@ export class GeminiController {
       return;
     }
 
-    await this.dispatchAction(parsed.model, parsed.action, body, res);
+    await this.handleModelActionDispatch(parsed.model, parsed.action, body, res);
   }
 
   @Post('models/:model/countTokens')
@@ -91,10 +96,10 @@ export class GeminiController {
     @Body() body: GeminiRequest,
     @Res() res: FastifyReply,
   ) {
-    await this.dispatchAction(`models/${model}`, 'countTokens', body, res);
+    await this.handleModelActionDispatch(`models/${model}`, 'countTokens', body, res);
   }
 
-  private async dispatchAction(
+  private async handleModelActionDispatch(
     model: string,
     action: string,
     body: GeminiRequest,
@@ -111,14 +116,14 @@ export class GeminiController {
       if (action === 'streamGenerateContent') {
         const stream = await this.proxyService.handleGeminiStreamGenerateContent(model, body);
         if (stream instanceof Observable) {
-          this.sendObservableSse(res, stream);
+          this.writeObservableSseResponse(res, stream);
           return;
         }
       }
 
       if (action === 'generateContent') {
         const result = await this.proxyService.handleGeminiGenerateContent(model, body);
-        res.status(HttpStatus.OK).send(this.normalizeGeminiGenerateResponse(result));
+        res.status(HttpStatus.OK).send(this.buildNormalizedGeminiGenerateResponse(result));
         return;
       }
 
@@ -141,7 +146,7 @@ export class GeminiController {
     }
   }
 
-  private parseCombinedModelAction(modelAction: string): {
+  private parseModelActionToken(modelAction: string): {
     model: string;
     action: string;
   } | null {
@@ -165,7 +170,10 @@ export class GeminiController {
 
   private buildGeminiModelList(): GeminiModelMetadata[] {
     const config = getServerConfig();
-    const dynamicModelIds = getAllDynamicModels(config?.custom_mapping ?? {});
+    const dynamicModelIds = getAllDynamicModels(
+      config?.custom_mapping ?? {},
+      this.tokenManager?.getAllCollectedModels(),
+    );
 
     return dynamicModelIds.map((id) => this.toGeminiModelMetadata(`models/${id}`));
   }
@@ -186,7 +194,7 @@ export class GeminiController {
     };
   }
 
-  private normalizeGeminiGenerateResponse(response: GeminiResponse): GeminiResponse {
+  private buildNormalizedGeminiGenerateResponse(response: GeminiResponse): GeminiResponse {
     const candidates = (response.candidates ?? []).map((candidate, index) => ({
       content: candidate.content,
       finishReason: candidate.finishReason,
@@ -235,7 +243,7 @@ export class GeminiController {
     return normalized;
   }
 
-  private sendObservableSse(res: FastifyReply, stream: Observable<unknown>): void {
+  private writeObservableSseResponse(res: FastifyReply, stream: Observable<unknown>): void {
     if (
       !res.raw ||
       typeof res.raw.writeHead !== 'function' ||
@@ -248,7 +256,7 @@ export class GeminiController {
       return;
     }
 
-    if (this.hasHijack(res)) {
+    if (this.supportsReplyHijack(res)) {
       res.hijack();
     }
 
@@ -293,7 +301,7 @@ export class GeminiController {
     });
   }
 
-  private hasHijack(reply: FastifyReply): reply is FastifyReply & { hijack: () => void } {
+  private supportsReplyHijack(reply: FastifyReply): reply is FastifyReply & { hijack: () => void } {
     return typeof (reply as { hijack?: unknown }).hijack === 'function';
   }
 }

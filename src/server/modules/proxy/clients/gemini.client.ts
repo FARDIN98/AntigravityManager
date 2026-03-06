@@ -4,11 +4,12 @@ import { isNil } from 'lodash-es';
 import { GeminiRequest, GeminiResponse } from '../interfaces/request-interfaces';
 import { GeminiInternalRequest } from '../../../../lib/antigravity/types';
 import { getServerConfig } from '../../../server-config';
+import { resolveRequestUserAgent } from '../request-user-agent';
+import { UpstreamRequestError } from './upstream-error';
 
 @Injectable()
 export class GeminiClient {
   private readonly logger = new Logger(GeminiClient.name);
-  private readonly defaultRequestUserAgent = 'antigravity/1.11.9 windows/amd64';
   // Default to v1beta for most features
   private readonly baseUrl = 'https://generativelanguage.googleapis.com/v1beta';
   private readonly defaultInternalBaseUrls = [
@@ -23,7 +24,7 @@ export class GeminiClient {
     upstreamProxyUrl?: string,
   ): Promise<NodeJS.ReadableStream> {
     const url = `${this.baseUrl}/models/${model}:streamGenerateContent?alt=sse`;
-    const axiosProxy = this.resolveAxiosProxy(upstreamProxyUrl);
+    const axiosProxy = this.resolveUpstreamAxiosProxy(upstreamProxyUrl);
 
     try {
       const response = await axios.post(url, content, {
@@ -39,7 +40,14 @@ export class GeminiClient {
     } catch (error) {
       if (axios.isAxiosError(error)) {
         this.logger.error(`Gemini stream request failed: ${error.message}`);
-        throw new Error(error.response?.data?.error?.message || error.message);
+        throw new UpstreamRequestError({
+          message: error.response?.data?.error?.message || error.message,
+          status: error.response?.status,
+          headers: {
+            retryAfter: this.extractRetryAfterHeader(error.response?.headers),
+          },
+          body: this.describeAxiosErrorData(error.response?.data),
+        });
       }
       this.throwAsCleanError(error);
     }
@@ -52,7 +60,7 @@ export class GeminiClient {
     upstreamProxyUrl?: string,
   ): Promise<GeminiResponse> {
     const url = `${this.baseUrl}/models/${model}:generateContent`;
-    const axiosProxy = this.resolveAxiosProxy(upstreamProxyUrl);
+    const axiosProxy = this.resolveUpstreamAxiosProxy(upstreamProxyUrl);
 
     try {
       const response = await axios.post<GeminiResponse>(url, content, {
@@ -69,7 +77,14 @@ export class GeminiClient {
         this.logger.error(
           `Gemini request failed: ${error.message} - ${this.safeStringify(error.response?.data)}`,
         );
-        throw new Error(error.response?.data?.error?.message || error.message);
+        throw new UpstreamRequestError({
+          message: error.response?.data?.error?.message || error.message,
+          status: error.response?.status,
+          headers: {
+            retryAfter: this.extractRetryAfterHeader(error.response?.headers),
+          },
+          body: this.describeAxiosErrorData(error.response?.data),
+        });
       }
       this.throwAsCleanError(error);
     }
@@ -83,7 +98,7 @@ export class GeminiClient {
     upstreamProxyUrl?: string,
     extraHeaders?: Record<string, string>,
   ): Promise<NodeJS.ReadableStream> {
-    const response = await this.requestWithEndpointFailover<NodeJS.ReadableStream>(
+    const response = await this.executeRequestWithEndpointFailover<NodeJS.ReadableStream>(
       ':streamGenerateContent?alt=sse',
       body,
       accessToken,
@@ -104,7 +119,7 @@ export class GeminiClient {
     upstreamProxyUrl?: string,
     extraHeaders?: Record<string, string>,
   ): Promise<GeminiResponse> {
-    const response = await this.requestWithEndpointFailover<
+    const response = await this.executeRequestWithEndpointFailover<
       GeminiResponse | { response: GeminiResponse }
     >(
       ':generateContent',
@@ -143,7 +158,7 @@ export class GeminiClient {
     return Math.max(1, timeoutSeconds) * 1000;
   }
 
-  private shouldSwitchEndpointOnError(error: unknown): boolean {
+  private shouldFailoverToNextEndpoint(error: unknown): boolean {
     if (!axios.isAxiosError(error)) {
       return false;
     }
@@ -162,7 +177,7 @@ export class GeminiClient {
     return status === 408 || status === 429 || status >= 500;
   }
 
-  private async requestWithEndpointFailover<T>(
+  private async executeRequestWithEndpointFailover<T>(
     path: string,
     body: GeminiInternalRequest,
     accessToken: string,
@@ -173,8 +188,8 @@ export class GeminiClient {
   ): Promise<AxiosResponse<T>> {
     const baseUrls = this.getInternalBaseUrls();
     const timeout = this.getInternalTimeoutMs();
-    const requestUserAgent = process.env.PROXY_REQUEST_USER_AGENT ?? this.defaultRequestUserAgent;
-    const axiosProxy = this.resolveAxiosProxy(upstreamProxyUrl);
+    const requestUserAgent = await resolveRequestUserAgent();
+    const axiosProxy = this.resolveUpstreamAxiosProxy(upstreamProxyUrl);
     let lastError: unknown = null;
 
     for (let index = 0; index < baseUrls.length; index++) {
@@ -197,8 +212,8 @@ export class GeminiClient {
         lastError = error;
         const hasNextEndpoint = index < baseUrls.length - 1;
 
-        if (!hasNextEndpoint || !this.shouldSwitchEndpointOnError(error)) {
-          await this.handleAxiosError(error, operation);
+        if (!hasNextEndpoint || !this.shouldFailoverToNextEndpoint(error)) {
+          await this.throwUpstreamRequestError(error, operation);
         }
 
         this.logger.warn(
@@ -209,11 +224,11 @@ export class GeminiClient {
       }
     }
 
-    await this.handleAxiosError(lastError, operation);
+    await this.throwUpstreamRequestError(lastError, operation);
     throw new Error(`[${operation}] unexpected control flow after upstream error handling`);
   }
 
-  private async handleAxiosError(error: unknown, operation: string): Promise<never> {
+  private async throwUpstreamRequestError(error: unknown, operation: string): Promise<never> {
     if (axios.isAxiosError(error)) {
       const responseData = error.response?.data;
       const upstreamMessage = await this.extractAxiosErrorMessage(responseData);
@@ -222,7 +237,14 @@ export class GeminiClient {
           responseData,
         )}`,
       );
-      throw new Error(upstreamMessage || error.message);
+      throw new UpstreamRequestError({
+        message: upstreamMessage || error.message,
+        status: error.response?.status,
+        headers: {
+          retryAfter: this.extractRetryAfterHeader(error.response?.headers),
+        },
+        body: this.describeAxiosErrorData(responseData),
+      });
     }
     this.throwAsCleanError(error);
   }
@@ -346,7 +368,9 @@ export class GeminiClient {
     return this.safeStringify(responseData);
   }
 
-  private resolveAxiosProxy(upstreamProxyUrl?: string): AxiosProxyConfig | false | undefined {
+  private resolveUpstreamAxiosProxy(
+    upstreamProxyUrl?: string,
+  ): AxiosProxyConfig | false | undefined {
     const config = getServerConfig();
     const configuredProxyUrl =
       upstreamProxyUrl ||
@@ -380,6 +404,24 @@ export class GeminiClient {
       this.logger.warn(`Upstream proxy URL is invalid: ${configuredProxyUrl}`);
       return undefined;
     }
+  }
+
+  private extractRetryAfterHeader(headers: unknown): string | undefined {
+    if (!headers || typeof headers !== 'object') {
+      return undefined;
+    }
+
+    const retryAfter = (headers as Record<string, unknown>)['retry-after'];
+    if (typeof retryAfter === 'string' && retryAfter.trim() !== '') {
+      return retryAfter.trim();
+    }
+    if (Array.isArray(retryAfter) && retryAfter.length > 0) {
+      const first = retryAfter[0];
+      if (typeof first === 'string' && first.trim() !== '') {
+        return first.trim();
+      }
+    }
+    return undefined;
   }
 
   private throwAsCleanError(error: unknown): never {

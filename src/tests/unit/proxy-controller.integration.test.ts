@@ -200,6 +200,73 @@ describe('ProxyController Integration', () => {
     );
   });
 
+  it('supports OpenAI responses compatibility endpoint in stream mode with SSE headers', async () => {
+    const stream = of('data: {"id":"chatcmpl_resp_stream"}\n\n');
+    const proxyService = {
+      handleChatCompletions: vi.fn().mockResolvedValue(stream),
+    };
+
+    const controller = new ProxyController(proxyService as any);
+    const reply = createReplyMock();
+
+    await controller.responses(
+      {
+        model: 'gpt-4o',
+        instructions: 'stream output',
+        input: 'hello',
+        stream: true,
+      },
+      reply as any,
+    );
+
+    expect(reply.header).toHaveBeenCalledWith('Content-Type', 'text/event-stream');
+    expect(reply.header).toHaveBeenCalledWith('Cache-Control', 'no-cache');
+    expect(reply.header).toHaveBeenCalledWith('Connection', 'keep-alive');
+    expect(reply.send).toHaveBeenCalledWith(stream);
+  });
+
+  it('normalizes web_search_call in /v1/responses into builtin_web_search tool messages', async () => {
+    const proxyService = {
+      handleChatCompletions: vi.fn().mockResolvedValue({
+        id: 'chatcmpl_resp_search',
+        object: 'chat.completion',
+        created: 1700000002,
+        model: 'gpt-4o',
+        choices: [{ index: 0, finish_reason: 'stop', message: { content: 'done' } }],
+        usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+      }),
+    };
+
+    const controller = new ProxyController(proxyService as any);
+    const reply = createReplyMock();
+
+    await controller.responses(
+      {
+        model: 'gpt-4o',
+        input: [
+          {
+            type: 'web_search_call',
+            call_id: 'call_search_1',
+            action: { query: 'gemini api' },
+          },
+          {
+            type: 'function_call_output',
+            call_id: 'call_search_1',
+            output: { content: 'search result' },
+          },
+        ],
+      },
+      reply as any,
+    );
+
+    const callArg = proxyService.handleChatCompletions.mock.calls[0][0];
+    const assistantMessage = callArg.messages.find((message: { role: string }) => message.role === 'assistant');
+    const toolMessage = callArg.messages.find((message: { role: string }) => message.role === 'tool');
+
+    expect(assistantMessage?.tool_calls?.[0]?.function?.name).toBe('builtin_web_search');
+    expect(toolMessage?.name).toBe('builtin_web_search');
+  });
+
   it('supports image generations endpoint', async () => {
     const proxyService = {
       handleChatCompletions: vi.fn().mockResolvedValue({
