@@ -1,6 +1,8 @@
 import { v4 as uuidv4 } from 'uuid';
-import { mapClaudeModelToGemini } from './ModelMapping';
-import { cleanJsonSchema } from './JsonSchemaUtils';
+import { isPlainObject, isString } from 'lodash-es';
+import { mapClaudeModelToGemini, normalizeGeminiModelAlias } from './ModelMapping';
+import { getMaxOutputTokens, getThinkingBudget } from './ModelSpecs';
+import { cleanJsonSchema, normalizeObjectJsonSchema } from './JsonSchemaUtils';
 import { SignatureStore } from './SignatureStore';
 import { logger } from '../../utils/logger';
 import {
@@ -15,6 +17,11 @@ import {
   FunctionDeclaration,
   SafetySetting,
 } from './types';
+import {
+  buildUserAgent,
+  FALLBACK_VERSION,
+  resolveLocalInstalledVersion,
+} from '@/server/modules/proxy/request-user-agent';
 
 /**
  * Request Configuration
@@ -44,6 +51,7 @@ interface RequestConfig {
 export function transformClaudeRequestIn(
   claudeReq: ClaudeRequest,
   projectId?: string,
+  userAgent?: string,
 ): GeminiInternalRequest {
   // Check for networking tools (server tool or built-in tool)
   const hasWebSearchTool = detectsNetworkingTool(claudeReq.tools);
@@ -55,9 +63,7 @@ export function transformClaudeRequestIn(
   const systemInstruction = buildSystemInstruction(claudeReq.system);
 
   // Map model name
-  const mappedModel = hasWebSearchTool
-    ? 'gemini-2.5-flash'
-    : mapClaudeModelToGemini(claudeReq.model);
+  const mappedModel = hasWebSearchTool ? 'gemini-3-flash' : mapClaudeModelToGemini(claudeReq.model);
 
   // Convert Claude tools to Tool array for networking detection
   const toolsVal: Tool[] | undefined = claudeReq.tools
@@ -70,7 +76,11 @@ export function transformClaudeRequestIn(
   const allowDummyThought = config.finalModel.startsWith('gemini-');
 
   // 4. Generation Config & Thinking
-  let isThinkingEnabled = claudeReq.thinking?.type === 'enabled';
+  const thinkingType = (claudeReq.thinking?.type ?? '').toLowerCase();
+  const autoThinkingEnabled =
+    !claudeReq.thinking && shouldEnableThinkingByDefault(config.finalModel, claudeReq.model);
+  let isThinkingEnabled =
+    thinkingType === 'enabled' || thinkingType === 'adaptive' || autoThinkingEnabled;
 
   if (isThinkingEnabled) {
     const globalSig = SignatureStore.get();
@@ -82,11 +92,18 @@ export function transformClaudeRequestIn(
     });
 
     if (hasFunctionCalls && !hasValidSignatureForFunctionCalls(claudeReq.messages, globalSig)) {
-      isThinkingEnabled = false;
+      if (!isGeminiFlashModel(config.finalModel)) {
+        isThinkingEnabled = false;
+      }
     }
   }
 
-  const generationConfig = buildGenerationConfig(claudeReq, hasWebSearchTool, config.finalModel);
+  const generationConfig = buildGenerationConfig(
+    claudeReq,
+    hasWebSearchTool,
+    config.finalModel,
+    isThinkingEnabled,
+  );
   // Update thinking config based on the final decision
   if (!isThinkingEnabled && generationConfig.thinkingConfig) {
     delete generationConfig.thinkingConfig;
@@ -98,10 +115,11 @@ export function transformClaudeRequestIn(
     toolIdToName,
     isThinkingEnabled,
     allowDummyThought,
+    config.finalModel,
   );
 
   // 3. Tools
-  const tools = buildTools(claudeReq.tools, hasWebSearchTool);
+  const tools = buildTools(claudeReq.tools, hasWebSearchTool, config.finalModel);
 
   // 5. Safety Settings
   const safetySettings = [
@@ -142,7 +160,7 @@ export function transformClaudeRequestIn(
 
   // Inject googleSearch tool if needed (and not already done by buildTools)
   if (config.injectGoogleSearch && !hasWebSearchTool) {
-    injectGoogleSearchTool(innerRequest);
+    injectGoogleSearchTool(innerRequest, config.finalModel);
   }
 
   // Inject imageConfig if present (for image generation models)
@@ -165,11 +183,12 @@ export function transformClaudeRequestIn(
 
   const normalizedProjectId = projectId?.trim();
 
+  const discoveryVersion = resolveLocalInstalledVersion() ?? FALLBACK_VERSION;
   const body: GeminiInternalRequest = {
     requestId: requestId,
     request: innerRequest as GeminiInternalRequest['request'],
     model: config.finalModel,
-    userAgent: 'antigravity',
+    userAgent: userAgent?.trim() || buildUserAgent(discoveryVersion),
     requestType: config.requestType,
   };
 
@@ -194,7 +213,7 @@ function resolveRequestConfig(
   tools?: Tool[],
 ): RequestConfig {
   // 1. Image Generation Check
-  if (mappedModel.startsWith('gemini-3-pro-image')) {
+  if (isGeminiImageModel(mappedModel)) {
     const { imageConfig, parsedBaseModel } = parseImageConfig(originalModel);
     return {
       requestType: 'image_gen',
@@ -212,18 +231,11 @@ function resolveRequestConfig(
   const enableNetworking = isOnlineSuffix || hasNetworkingTool;
 
   let finalModel = mappedModel.replace(/-online$/, '');
-
-  if (finalModel === 'gemini-3-pro-preview') {
-    finalModel = 'gemini-3-pro-high';
-  } else if (finalModel === 'gemini-3-pro-image-preview') {
-    finalModel = 'gemini-3-pro-image';
-  } else if (finalModel === 'gemini-3-flash-preview') {
-    finalModel = 'gemini-3-flash';
-  }
+  finalModel = normalizeGeminiModelAlias(finalModel);
 
   if (enableNetworking) {
-    if (finalModel !== 'gemini-2.5-flash') {
-      finalModel = 'gemini-2.5-flash';
+    if (finalModel !== 'gemini-3-flash') {
+      finalModel = 'gemini-3-flash';
     }
   }
 
@@ -260,6 +272,50 @@ function parseImageConfig(modelName: string): {
   return { imageConfig: config, parsedBaseModel: 'gemini-3-pro-image' };
 }
 
+function isGeminiImageModel(modelName: string): boolean {
+  const normalized = modelName.toLowerCase();
+  return (
+    normalized.startsWith('gemini-3-pro-image') || normalized.startsWith('gemini-3.1-pro-image')
+  );
+}
+
+function isGeminiFlashModel(modelName: string): boolean {
+  const normalized = modelName.toLowerCase();
+  return normalized.includes('gemini-3-flash') || normalized.includes('gemini-3.1-flash');
+}
+
+function shouldEnableThinkingByDefault(mappedModel: string, originalModel: string): boolean {
+  const mappedLower = mappedModel.toLowerCase();
+  const originalLower = originalModel.toLowerCase();
+  return (
+    originalLower.includes('claude-opus-4-5') ||
+    originalLower.includes('claude-opus-4-6') ||
+    mappedLower.includes('-thinking') ||
+    mappedLower.includes('gemini-3.1-pro') ||
+    mappedLower.includes('gemini-3-flash') ||
+    mappedLower.includes('gemini-3.1-flash')
+  );
+}
+
+function isClaudeModel(modelName: string): boolean {
+  return modelName.toLowerCase().includes('claude');
+}
+
+function resolveAdaptiveThinkingLevel(claudeReq: ClaudeRequest): 'low' | 'medium' | 'high' {
+  const effort = String(claudeReq.thinking?.effort ?? '').toLowerCase();
+  if (effort === 'low') {
+    return 'low';
+  }
+  if (effort === 'medium') {
+    return 'medium';
+  }
+  return 'high';
+}
+
+function toToolSchema(schema: unknown): Record<string, unknown> {
+  return normalizeObjectJsonSchema(schema);
+}
+
 /**
  * Detects if networking tools are present
  * Checks tool list for web search related tools
@@ -274,20 +330,23 @@ function detectsNetworkingTool(tools?: (Tool | GeminiToolDeclaration)[]): boolea
     'google_search',
     'web_search_20250305',
     'google_search_retrieval',
+    'builtin_web_search',
   ];
 
   for (const tool of tools) {
     // Claude Tool format
-    if ('name' in tool && tool.name && keywords.includes(tool.name)) {
+    const toolName = (tool as { name?: unknown }).name;
+    if (isString(toolName) && keywords.includes(toolName)) {
       return true;
     }
-    if ('type' in tool && tool.type && keywords.includes(tool.type)) {
+    const toolType = (tool as { type?: unknown }).type;
+    if (isString(toolType) && keywords.includes(toolType)) {
       return true;
     }
 
     // OpenAI nested format (runtime check)
     const openaiTool = tool as { function?: { name?: string } };
-    if (openaiTool.function?.name && keywords.includes(openaiTool.function.name)) {
+    if (isString(openaiTool.function?.name) && keywords.includes(openaiTool.function.name)) {
       return true;
     }
 
@@ -315,15 +374,25 @@ function detectsNetworkingTool(tools?: (Tool | GeminiToolDeclaration)[]): boolea
  * Inject Google Search Tool
  * Adds googleSearch tool to the request
  */
-function injectGoogleSearchTool(body: { tools?: GeminiToolDeclaration[] }) {
+function supportsMixedTools(mappedModel?: string): boolean {
+  if (!mappedModel) {
+    return false;
+  }
+  const modelLower = mappedModel.toLowerCase();
+  return modelLower.includes('gemini-3');
+}
+
+function injectGoogleSearchTool(body: { tools?: GeminiToolDeclaration[] }, mappedModel?: string) {
   if (!body.tools) {
     body.tools = [];
   }
   const toolsArr = body.tools;
 
   const hasFunctions = toolsArr.some((t) => t.functionDeclarations);
-  if (hasFunctions) {
-    logger.info('Skipping googleSearch injection due to existing functionDeclarations');
+  if (hasFunctions && !supportsMixedTools(mappedModel)) {
+    logger.info(
+      'Skipping googleSearch injection due to existing functionDeclarations on old model',
+    );
     return;
   }
 
@@ -351,7 +420,7 @@ function buildSystemInstruction(
   let hasIdentityDirective = false;
 
   if (system) {
-    if (typeof system === 'string') {
+    if (isString(system)) {
       if (system.includes(identityMarker)) {
         hasIdentityDirective = true;
       }
@@ -370,7 +439,7 @@ function buildSystemInstruction(
   }
 
   if (system) {
-    if (typeof system === 'string') {
+    if (isString(system)) {
       parts.push({ text: system });
     } else if (Array.isArray(system)) {
       for (const block of system) {
@@ -437,6 +506,7 @@ function buildContents(
   toolIdToName: Map<string, string>,
   isThinkingEnabled: boolean,
   allowDummyThought: boolean,
+  mappedModel: string,
 ): GeminiContent[] {
   const contents: GeminiContent[] = [];
   let lastThoughtSignature: string | null = null;
@@ -480,12 +550,16 @@ function buildContents(
         cleanJsonSchema(part);
         toolIdToName.set(block.id, block.name);
         const finalSig = block.signature || lastThoughtSignature || SignatureStore.get();
-        if (finalSig) part.thoughtSignature = finalSig;
+        if (finalSig) {
+          part.thoughtSignature = finalSig;
+        } else if (isThinkingEnabled && isGeminiFlashModel(mappedModel)) {
+          part.thoughtSignature = 'skip_thought_signature_validator';
+        }
         parts.push(part);
       } else if (block.type === 'tool_result') {
         const funcName = toolIdToName.get(block.tool_use_id) || block.tool_use_id;
         let mergedContent = '';
-        if (typeof block.content === 'string') mergedContent = block.content;
+        if (isString(block.content)) mergedContent = block.content;
         else if (Array.isArray(block.content))
           mergedContent = block.content
             .filter((b: any) => b.type === 'text')
@@ -524,6 +598,7 @@ function buildContents(
 function buildTools(
   tools: Tool[] | undefined,
   hasWebSearch: boolean,
+  mappedModel: string,
 ): GeminiToolDeclaration[] | null {
   if (!tools) {
     return null;
@@ -535,14 +610,15 @@ function buildTools(
     if (
       tool.name === 'web_search' ||
       tool.name === 'google_search' ||
-      tool.type === 'web_search_20250305'
+      tool.name === 'builtin_web_search' ||
+      tool.type === 'web_search_20250305' ||
+      tool.type === 'builtin_web_search'
     ) {
       hasGoogleSearch = true;
       continue;
     }
     if (tool.name) {
-      const inputSchema = tool.input_schema || { type: 'object', properties: {} };
-      cleanJsonSchema(inputSchema);
+      const inputSchema = toToolSchema(tool.input_schema);
       functionDeclarations.push({
         name: tool.name,
         description: tool.description,
@@ -551,15 +627,24 @@ function buildTools(
     }
   }
 
-  const toolObj: GeminiToolDeclaration = {};
+  const toolList: GeminiToolDeclaration[] = [];
   if (functionDeclarations.length > 0) {
-    toolObj.functionDeclarations = functionDeclarations;
+    toolList.push({ functionDeclarations });
+    if (hasGoogleSearch) {
+      if (supportsMixedTools(mappedModel)) {
+        toolList.push({ googleSearch: {} });
+      } else {
+        logger.info(
+          `[Claude-Request] Skipping googleSearch injection for ${mappedModel} due to existing functionDeclarations on old model`,
+        );
+      }
+    }
   } else if (hasGoogleSearch) {
-    toolObj.googleSearch = {};
+    toolList.push({ googleSearch: {} });
   }
 
-  if (Object.keys(toolObj).length > 0) {
-    return [toolObj];
+  if (toolList.length > 0) {
+    return toolList;
   }
   return null;
 }
@@ -572,32 +657,53 @@ function buildGenerationConfig(
   claudeReq: ClaudeRequest,
   hasWebSearch: boolean,
   mappedModel: string,
+  isThinkingEnabled: boolean,
 ): GenerationConfig {
   const source = String(claudeReq.metadata?.source || '').toLowerCase();
   const isOpenAIPath = source === 'openai';
   const config: GenerationConfig = {};
+  const thinkingType = String(claudeReq.thinking?.type ?? '').toLowerCase();
+
+  const buildThinkingConfig = (): GenerationConfig['thinkingConfig'] => {
+    const thinkingConfig: GenerationConfig['thinkingConfig'] = { includeThoughts: true };
+    if (thinkingType === 'adaptive') {
+      if (isClaudeModel(mappedModel)) {
+        thinkingConfig.thinkingLevel = resolveAdaptiveThinkingLevel(claudeReq);
+      } else {
+        thinkingConfig.thinkingBudget = 24576;
+      }
+    } else if (claudeReq.thinking?.budget_tokens) {
+      let budget = claudeReq.thinking.budget_tokens;
+      const isFlash = hasWebSearch || isGeminiFlashModel(mappedModel);
+      if (isFlash) {
+        budget = Math.min(budget, 24576);
+      }
+      thinkingConfig.thinkingBudget = budget;
+    } else {
+      thinkingConfig.thinkingBudget = getThinkingBudget(mappedModel);
+    }
+    return thinkingConfig;
+  };
 
   if (isOpenAIPath) {
     config.temperature = claudeReq.temperature ?? 1.0;
     config.topP = claudeReq.top_p ?? 0.95;
     if (claudeReq.max_tokens !== undefined) {
       config.maxOutputTokens = claudeReq.max_tokens;
+    } else {
+      config.maxOutputTokens = getMaxOutputTokens(mappedModel);
     }
     if (claudeReq.stop_sequences && claudeReq.stop_sequences.length > 0) {
       config.stopSequences = claudeReq.stop_sequences;
     }
+    if (isThinkingEnabled) {
+      config.thinkingConfig = buildThinkingConfig();
+    }
     return config;
   }
 
-  if (claudeReq.thinking?.type === 'enabled') {
-    const thinkingConfig: GenerationConfig['thinkingConfig'] = { includeThoughts: true };
-    if (claudeReq.thinking.budget_tokens) {
-      let budget = claudeReq.thinking.budget_tokens;
-      const isFlash = hasWebSearch || mappedModel.includes('gemini-2.5-flash');
-      if (isFlash) budget = Math.min(budget, 24576);
-      thinkingConfig.thinkingBudget = budget;
-    }
-    config.thinkingConfig = thinkingConfig;
+  if (isThinkingEnabled) {
+    config.thinkingConfig = buildThinkingConfig();
   }
   if (claudeReq.temperature !== undefined) {
     config.temperature = claudeReq.temperature;
@@ -623,7 +729,7 @@ function buildGenerationConfig(
 function deepCleanUndefined(obj: unknown): void {
   if (Array.isArray(obj)) {
     obj.forEach(deepCleanUndefined);
-  } else if (obj && typeof obj === 'object') {
+  } else if (isPlainObject(obj)) {
     const record = obj as Record<string, unknown>;
     Object.keys(record).forEach((key) => {
       if (record[key] === undefined) delete record[key];

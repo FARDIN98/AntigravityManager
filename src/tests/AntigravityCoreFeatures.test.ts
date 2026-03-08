@@ -79,7 +79,7 @@ describe('Antigravity Core Features (Business Logic)', () => {
       const requestWithTools = {
         ...BASE_REQUEST,
         // Maps to a gemini-3 model potentially
-        model: 'gemini-3-pro-preview',
+        model: 'gemini-3.1-pro-preview',
         tools: [{ name: 'get_weather' }], // Mock tool structure
         thinking: { type: 'enabled', budget_tokens: 1000 },
       } as any;
@@ -96,7 +96,7 @@ describe('Antigravity Core Features (Business Logic)', () => {
 
       const requestWithTools = {
         ...BASE_REQUEST,
-        model: 'gemini-3-pro-preview',
+        model: 'gemini-3.1-pro-preview',
         tools: [{ name: 'get_weather' }],
         thinking: { type: 'enabled', budget_tokens: 1000 },
       } as any;
@@ -110,7 +110,7 @@ describe('Antigravity Core Features (Business Logic)', () => {
     it('should KEEP thinking mode if NO function calls exist (pure thinking)', () => {
       const requestPureThinking = {
         ...BASE_REQUEST,
-        model: 'gemini-3-pro-preview',
+        model: 'gemini-3.1-pro-preview',
         // No tools
         thinking: { type: 'enabled', budget_tokens: 1000 },
       } as any;
@@ -119,6 +119,61 @@ describe('Antigravity Core Features (Business Logic)', () => {
 
       // Should keep thinking config
       expect(result.request.generationConfig?.thinkingConfig).toBeDefined();
+    });
+
+    it('should auto-enable thinking for gemini-3-flash even without explicit thinking config', () => {
+      const result = transformClaudeRequestIn(
+        {
+          ...BASE_REQUEST,
+          model: 'gemini-3-flash',
+          thinking: undefined,
+        } as any,
+        'test-project',
+      );
+
+      expect(result.request.generationConfig?.thinkingConfig).toBeDefined();
+      expect(result.request.generationConfig?.thinkingConfig?.includeThoughts).toBe(true);
+    });
+
+    it('should inject flash sentinel thoughtSignature for tool_use without cached signature', () => {
+      const requestWithToolUse = {
+        ...BASE_REQUEST,
+        model: 'gemini-3-flash',
+        thinking: undefined,
+        messages: [
+          {
+            role: 'assistant',
+            content: [
+              {
+                type: 'tool_use',
+                id: 'call_1',
+                name: 'get_weather',
+                input: { location: 'Beijing' },
+              },
+            ],
+          },
+        ],
+      } as any;
+
+      const result = transformClaudeRequestIn(requestWithToolUse, 'test-project');
+      const part = result.request.contents?.[0]?.parts?.[0] as any;
+      expect(part?.thoughtSignature).toBe('skip_thought_signature_validator');
+    });
+
+    it('should keep mixed tools for gemini 2.x+ when both function and web search are requested', () => {
+      const mixedToolsRequest = {
+        ...BASE_REQUEST,
+        model: 'gemini-2.0-flash-online',
+        tools: [{ name: 'get_weather' }, { name: 'web_search' }],
+      } as any;
+
+      const result = transformClaudeRequestIn(mixedToolsRequest, 'test-project');
+      const tools = result.request.tools || [];
+      const hasFunctions = tools.some((tool: any) => Array.isArray(tool.functionDeclarations));
+      const hasGoogleSearch = tools.some((tool: any) => tool.googleSearch);
+
+      expect(hasFunctions).toBe(true);
+      expect(hasGoogleSearch).toBe(true);
     });
   });
 });

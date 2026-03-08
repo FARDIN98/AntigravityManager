@@ -173,19 +173,19 @@ export class StreamingState {
     // Process grounding (web search) -> convert to Markdown text block
     let groundingText = '';
     if (this.webSearchQuery) {
-      groundingText += `\n\n---\n**🔍 已为您搜索：** ${this.webSearchQuery}`;
+      groundingText += `\n\n---\n**🔍 Searched for you:** ${this.webSearchQuery}`;
     }
     if (this.groundingChunks && this.groundingChunks.length > 0) {
       const links: string[] = [];
       this.groundingChunks.forEach((chunk, i) => {
         if (chunk.web) {
-          const title = chunk.web.title || '网页来源';
+          const title = chunk.web.title || 'Web source';
           const uri = chunk.web.uri || '#';
           links.push(`[${i + 1}] [${title}](${uri})`);
         }
       });
       if (links.length > 0) {
-        groundingText += `\n\n**🌐 来源引文：**\n` + links.join('\n');
+        groundingText += `\n\n**🌐 Citations:**\n` + links.join('\n');
       }
     }
 

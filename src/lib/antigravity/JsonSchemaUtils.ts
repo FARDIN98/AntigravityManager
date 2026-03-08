@@ -32,13 +32,37 @@ export function cleanJsonSchema(value: any) {
   cleanJsonSchemaRecursive(value);
 }
 
+export function normalizeObjectJsonSchema(schema: unknown): Record<string, unknown> {
+  const fallbackSchema: Record<string, unknown> = { type: 'object', properties: {} };
+  if (!schema || typeof schema !== 'object' || Array.isArray(schema)) {
+    return fallbackSchema;
+  }
+
+  const normalizedSchema = JSON.parse(JSON.stringify(schema)) as Record<string, unknown>;
+  cleanJsonSchema(normalizedSchema);
+
+  if (typeof normalizedSchema.type !== 'string') {
+    normalizedSchema.type = 'object';
+  }
+  if (
+    normalizedSchema.type === 'object' &&
+    (!normalizedSchema.properties ||
+      typeof normalizedSchema.properties !== 'object' ||
+      Array.isArray(normalizedSchema.properties))
+  ) {
+    normalizedSchema.properties = {};
+  }
+
+  return normalizedSchema;
+}
+
 /**
  * Recursively expand $ref
  */
 function flattenRefs(map: any, defs: Record<string, any>) {
   if (!map || typeof map !== 'object') return;
 
-  // 检查并替换 $ref
+  // Check and replace $ref
   if (typeof map['$ref'] === 'string') {
     const refPath = map['$ref'];
     // Parse reference name (e.g. #/$defs/MyType -> MyType)

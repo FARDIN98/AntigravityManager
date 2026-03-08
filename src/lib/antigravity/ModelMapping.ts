@@ -1,23 +1,37 @@
 import { logger } from '../../utils/logger';
 
+const PUBLIC_SUPPORTED_MODELS = [
+  'gemini-3.1-pro-high',
+  'gemini-3.1-pro-low',
+  'gemini-3-flash',
+  'claude-sonnet-4-6-thinking',
+  'claude-opus-4-6-thinking',
+] as const;
+
 const CLAUDE_TO_GEMINI: Record<string, string> = {
   // Directly supported models
-  'claude-opus-4-5-thinking': 'claude-opus-4-5-thinking',
+  'claude-sonnet-4-6-thinking': 'claude-sonnet-4-6-thinking',
   'claude-opus-4-6-thinking': 'claude-opus-4-6-thinking',
-  'claude-sonnet-4-5': 'claude-sonnet-4-5',
-  'claude-sonnet-4-5-thinking': 'claude-sonnet-4-5-thinking',
+  'gemini-3.1-pro-low': 'gemini-3.1-pro-low',
+  'gemini-3.1-pro-high': 'gemini-3.1-pro-high',
+  'gemini-3-flash': 'gemini-3-flash',
 
   // Alias mappings
-  'claude-sonnet-4-5-20250929': 'claude-sonnet-4-5-thinking',
-  'claude-3-5-sonnet-20241022': 'claude-sonnet-4-5',
-  'claude-3-5-sonnet-20240620': 'claude-sonnet-4-5',
-  'claude-opus-4': 'claude-opus-4-5-thinking',
-  'claude-opus-4-5-20251101': 'claude-opus-4-5-thinking',
+  'claude-sonnet-4-6': 'claude-sonnet-4-6-thinking',
+  'claude-sonnet-4-6-20260219': 'claude-sonnet-4-6-thinking',
+  'claude-sonnet-4-5': 'claude-sonnet-4-6-thinking',
+  'claude-sonnet-4-5-thinking': 'claude-sonnet-4-6-thinking',
+  'claude-sonnet-4-5-20250929': 'claude-sonnet-4-6-thinking',
+  'claude-3-5-sonnet-20241022': 'claude-sonnet-4-6-thinking',
+  'claude-3-5-sonnet-20240620': 'claude-sonnet-4-6-thinking',
+  'claude-opus-4': 'claude-opus-4-6-thinking',
+  'claude-opus-4-5-thinking': 'claude-opus-4-6-thinking',
+  'claude-opus-4-5-20251101': 'claude-opus-4-6-thinking',
   'claude-opus-4-6': 'claude-opus-4-6-thinking',
   'claude-opus-4-6-20260201': 'claude-opus-4-6-thinking',
-  'claude-haiku-4': 'claude-sonnet-4-5',
-  'claude-3-haiku-20240307': 'claude-sonnet-4-5',
-  'claude-haiku-4-5-20251001': 'claude-sonnet-4-5',
+  'claude-haiku-4': 'claude-sonnet-4-6-thinking',
+  'claude-3-haiku-20240307': 'claude-sonnet-4-6-thinking',
+  'claude-haiku-4-5-20251001': 'claude-sonnet-4-6-thinking',
 
   // OpenAI Protocol Mapping
   'gpt-4': 'gemini-2.5-flash',
@@ -41,14 +55,14 @@ const CLAUDE_TO_GEMINI: Record<string, string> = {
   'gpt-3.5-turbo-0613': 'gemini-2.5-flash',
 
   // Gemini Protocol Mapping
-  'gemini-2.5-flash-lite': 'gemini-2.5-flash',
-  'gemini-2.5-flash-thinking': 'gemini-2.5-flash-thinking',
-  'gemini-3-pro-low': 'gemini-3-pro-preview',
-  'gemini-3-pro-high': 'gemini-3-pro-preview',
-  'gemini-3-pro-preview': 'gemini-3-pro-preview',
-  'gemini-3-pro': 'gemini-3-pro-preview',
-  'gemini-2.5-flash': 'gemini-2.5-flash',
-  'gemini-3-flash': 'gemini-3-flash',
+  'gemini-2.5-flash-lite': 'gemini-3-flash',
+  'gemini-3.1-pro-preview': 'gemini-3.1-pro-high',
+  'gemini-3.1-pro': 'gemini-3.1-pro-high',
+  'gemini-3.0-pro': 'gemini-3.1-pro-high',
+  'gemini-2.5-flash': 'gemini-3-flash',
+  'gemini-2.5-pro': 'gemini-3.1-pro-high',
+  'gemini-2.0-flash': 'gemini-3-flash',
+  'gemini-2.0-flash-online': 'gemini-3-flash',
   'gemini-3-pro-image': 'gemini-3-pro-image',
   'internal-background-task': 'gemini-2.5-flash',
 };
@@ -57,22 +71,49 @@ const DYNAMIC_IMAGE_BASE_MODEL = 'gemini-3-pro-image';
 const DYNAMIC_IMAGE_RESOLUTIONS = ['', '-2k', '-4k'];
 const DYNAMIC_IMAGE_RATIOS = ['', '-1x1', '-4x3', '-3x4', '-16x9', '-9x16', '-21x9'];
 const EXTRA_DYNAMIC_MODELS = [
-  'gemini-2.0-flash-exp',
-  'gemini-2.5-flash',
   'gemini-3-flash',
-  'gemini-3-pro-high',
-  'gemini-3-pro-low',
+  'gemini-3.1-pro-high',
+  'gemini-3.1-pro-low',
 ];
+
+const DYNAMIC_MODEL_FORWARDING_RULES = new Map<string, string>();
 
 export const MODEL_LIST_CREATED_AT = 1770652800;
 
 export const MODEL_LIST_OWNER = 'antigravity';
 
+const GEMINI_MODEL_ALIASES: Record<string, string> = {
+  'gemini-3.1-pro': 'gemini-3.1-pro-high',
+  'gemini-3.0-pro': 'gemini-3.1-pro-high',
+  'gemini-3.1-pro-preview': 'gemini-3.1-pro-high',
+  'gemini-3-pro-image-preview': 'gemini-3-pro-image',
+  'gemini-3-flash-preview': 'gemini-3-flash',
+};
+
 export function getSupportedModels(): string[] {
-  return Object.keys(CLAUDE_TO_GEMINI);
+  return [...PUBLIC_SUPPORTED_MODELS];
 }
 
-export function getAllDynamicModels(customMapping: Record<string, string> = {}): string[] {
+export function updateDynamicForwardingRules(oldModel: string, newModel: string): void {
+  const normalizedOld = oldModel.trim();
+  const normalizedNew = newModel.trim();
+  if (!normalizedOld || !normalizedNew) {
+    return;
+  }
+  if (!DYNAMIC_MODEL_FORWARDING_RULES.has(normalizedOld)) {
+    logger.info(`[Router] Registered dynamic forwarding rule: ${normalizedOld} -> ${normalizedNew}`);
+  }
+  DYNAMIC_MODEL_FORWARDING_RULES.set(normalizedOld, normalizedNew);
+}
+
+export function getDynamicForwardingTarget(modelId: string): string | undefined {
+  return DYNAMIC_MODEL_FORWARDING_RULES.get(modelId);
+}
+
+export function getAllDynamicModels(
+  customMapping: Record<string, string> = {},
+  dynamicModelIds?: Iterable<string>,
+): string[] {
   const modelIds = new Set<string>();
 
   for (const modelId of getSupportedModels()) {
@@ -93,7 +134,17 @@ export function getAllDynamicModels(customMapping: Record<string, string> = {}):
     modelIds.add(modelId);
   }
 
-  return [...modelIds].sort();
+  if (dynamicModelIds) {
+    for (const dynamicModelId of dynamicModelIds) {
+      if (typeof dynamicModelId === 'string' && dynamicModelId.trim() !== '') {
+        modelIds.add(dynamicModelId.trim());
+      }
+    }
+  }
+
+  return [...modelIds]
+    .filter((id) => !shouldHideDeprecatedModelFromList(id))
+    .sort();
 }
 
 export function mapClaudeModelToGemini(input: string): string {
@@ -103,6 +154,11 @@ export function mapClaudeModelToGemini(input: string): string {
   }
 
   return input;
+}
+
+export function normalizeGeminiModelAlias(modelId: string): string {
+  const normalizedModelId = modelId.trim().toLowerCase();
+  return GEMINI_MODEL_ALIASES[normalizedModelId] ?? modelId;
 }
 
 /**
@@ -115,6 +171,12 @@ export function resolveModelRoute(
   openaiMapping: Record<string, string>,
   anthropicMapping: Record<string, string>,
 ): string {
+  const dynamicForwarded = getDynamicForwardingTarget(originalModel);
+  if (dynamicForwarded) {
+    logger.info(`[Router] Dynamic deprecated-model forwarding: ${originalModel} -> ${dynamicForwarded}`);
+    return dynamicForwarded;
+  }
+
   // 1. Check custom exact mapping (Highest priority)
   if (customMapping[originalModel]) {
     logger.info(
@@ -200,4 +262,32 @@ export function resolveModelRoute(
 
   // 4. Fall through to system default mapping logic
   return mapClaudeModelToGemini(originalModel);
+}
+
+function shouldHideDeprecatedModelFromList(modelId: string): boolean {
+  const normalized = modelId.toLowerCase();
+
+  if (/^gemini-1(\.|$|-)/.test(normalized) || /^gemini-2(\.|$|-)/.test(normalized)) {
+    return true;
+  }
+
+  if (normalized === 'gemini-3.1-pro' || normalized === 'gemini-3.1-pro-preview') {
+    return true;
+  }
+
+  const isLegacyGeminiPro =
+    /^gemini-3(\.0)?-pro($|-)/.test(normalized) && !normalized.startsWith('gemini-3-pro-image');
+  if (isLegacyGeminiPro) {
+    return true;
+  }
+
+  if (
+    normalized.includes('claude-sonnet-4-5') ||
+    normalized.includes('claude-opus-4-5') ||
+    normalized.includes('claude-haiku-4-5')
+  ) {
+    return true;
+  }
+
+  return false;
 }

@@ -6,14 +6,24 @@ export const UpstreamProxyConfigSchema = z.object({
 });
 
 export const ProxyConfigSchema = z.object({
-  enabled: z.boolean(), // 是否启用
-  port: z.number(), // 监听端口
-  api_key: z.string(), // API 密钥 (Also used for Admin Mode auth)
-  auto_start: z.boolean(), // 是否自动启动
+  enabled: z.boolean(),
+  port: z.number(),
+  api_key: z.string(),
+  auto_start: z.boolean(),
   backend_canary_enabled: z.boolean().default(true),
+  parity_enabled: z.boolean().default(false),
+  parity_shadow_enabled: z.boolean().default(false),
+  parity_kill_switch: z.boolean().default(false),
+  parity_no_go_mismatch_rate: z.number().default(0.15),
+  parity_no_go_error_rate: z.number().default(0.4),
+  scheduling_mode: z.enum(['cache-first', 'balance', 'performance-first']).default('balance'),
+  max_wait_seconds: z.number().default(60),
+  preferred_account_id: z.string().default(''),
+  circuit_breaker_enabled: z.boolean().default(true),
+  circuit_breaker_backoff_steps: z.array(z.number()).default([60, 300, 1800, 7200]),
   custom_mapping: z.record(z.string(), z.string()).default({}),
-  anthropic_mapping: z.record(z.string(), z.string()), // 映射表
-  request_timeout: z.number().default(120), // 超时秒数
+  anthropic_mapping: z.record(z.string(), z.string()), // Mapping table
+  request_timeout: z.number().default(120), // Timeout in seconds
   upstream_proxy: UpstreamProxyConfigSchema,
 });
 
@@ -27,7 +37,7 @@ export const AppConfigSchema = z.object({
   auto_startup: z.boolean(),
   error_reporting_enabled: z.boolean(),
   privacy_consent_asked: z.boolean().optional().default(false), // Optional for backward compatibility
-  default_export_path: z.string().nullable().optional(), // 导出路径
+  default_export_path: z.string().nullable().optional(), // Export path
   model_visibility: z.record(z.string(), z.boolean()).default({}), // Model visibility preferences
   provider_groupings_enabled: z.boolean().default(false), // Enable provider groupings UI
   grid_layout: z.enum(['auto', '2-col', '3-col', 'list']).default('auto'), // Account card grid layout
@@ -58,6 +68,16 @@ export const DEFAULT_APP_CONFIG: AppConfig = {
     api_key: '', // Generated dynamically if default needed
     auto_start: false,
     backend_canary_enabled: true,
+    parity_enabled: false,
+    parity_shadow_enabled: false,
+    parity_kill_switch: false,
+    parity_no_go_mismatch_rate: 0.15,
+    parity_no_go_error_rate: 0.4,
+    scheduling_mode: 'balance',
+    max_wait_seconds: 60,
+    preferred_account_id: '',
+    circuit_breaker_enabled: true,
+    circuit_breaker_backoff_steps: [60, 300, 1800, 7200],
     custom_mapping: {},
     anthropic_mapping: {},
     request_timeout: 120,

@@ -6,7 +6,13 @@ import { Observable } from 'rxjs';
 
 import { ProxyService } from '../../server/modules/proxy/proxy.service';
 
-const mockTokenManager = { getNextToken: vi.fn(), markAsRateLimited: vi.fn(), markAsForbidden: vi.fn() };
+const mockTokenManager = {
+  getNextToken: vi.fn(),
+  markAsRateLimited: vi.fn(),
+  markAsForbidden: vi.fn(),
+  markFromUpstreamError: vi.fn(),
+  recordParityError: vi.fn(),
+};
 const mockGeminiClient = { streamGenerateInternal: vi.fn(), generateInternal: vi.fn() };
 
 class TestableProxyService extends ProxyService {

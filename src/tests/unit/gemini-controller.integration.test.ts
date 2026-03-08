@@ -31,7 +31,14 @@ describe('GeminiController Integration', () => {
       expect.objectContaining({
         models: expect.arrayContaining([
           expect.objectContaining({
-            name: 'models/gemini-2.5-flash',
+            name: 'models/gemini-3-flash',
+            description: '',
+            inputTokenLimit: 128000,
+            outputTokenLimit: 8192,
+            supportedGenerationMethods: ['generateContent', 'countTokens'],
+          }),
+          expect.objectContaining({
+            name: 'models/gemini-3.1-pro-high',
             description: '',
             inputTokenLimit: 128000,
             outputTokenLimit: 8192,
@@ -74,13 +81,13 @@ describe('GeminiController Integration', () => {
     const reply = createReplyMock();
 
     await controller.modelAction(
-      'models/gemini-2.5-flash:generateContent',
+      'models/gemini-3.1-pro-high:generateContent',
       { contents: [{ role: 'user', parts: [{ text: 'hello' }] }] } as any,
       reply as any,
     );
 
     expect(proxyService.handleGeminiGenerateContent).toHaveBeenCalledWith(
-      'models/gemini-2.5-flash',
+      'models/gemini-3.1-pro-high',
       expect.any(Object),
     );
     expect(reply.status).toHaveBeenCalledWith(200);

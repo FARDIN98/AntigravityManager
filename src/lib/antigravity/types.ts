@@ -64,6 +64,7 @@ export interface ClaudeRequest {
 export interface ThinkingConfig {
   type: 'enabled' | string;
   budget_tokens?: number;
+  effort?: 'low' | 'medium' | 'high' | 'max' | string;
 }
 
 export type SystemPrompt = string | SystemBlock[];
@@ -194,6 +195,8 @@ export interface ThinkingGeminiConfig {
   includeThoughts: boolean;
   /** Thinking token budget */
   thinkingBudget?: number;
+  /** Thinking level for Claude-native adaptive modes */
+  thinkingLevel?: 'low' | 'medium' | 'high' | string;
 }
 
 /**
@@ -306,11 +309,22 @@ export interface QuotaData {
   models: Record<string, ModelQuotaInfo>;
   isForbidden: boolean;
   subscriptionTier?: string;
+  model_forwarding_rules?: Record<string, string>;
+  is_forbidden?: boolean;
+  subscription_tier?: string;
 }
 
 export interface ModelQuotaInfo {
   percentage: number;
   resetTime: string;
+  display_name?: string;
+  supports_images?: boolean;
+  supports_thinking?: boolean;
+  thinking_budget?: number;
+  recommended?: boolean;
+  max_tokens?: number;
+  max_output_tokens?: number;
+  supported_mime_types?: Record<string, boolean>;
 }
 
 export interface LoadProjectResponse {
@@ -327,7 +341,21 @@ export interface Tier {
 }
 
 export interface QuotaApiResponse {
-  models: Record<string, { quotaInfo?: { remainingFraction?: number; resetTime?: string } }>;
+  models: Record<
+    string,
+    {
+      quotaInfo?: { remainingFraction?: number; resetTime?: string };
+      displayName?: string;
+      supportsImages?: boolean;
+      supportsThinking?: boolean;
+      thinkingBudget?: number;
+      recommended?: boolean;
+      maxTokens?: number;
+      maxOutputTokens?: number;
+      supportedMimeTypes?: Record<string, boolean>;
+    }
+  >;
+  deprecatedModelIds?: Record<string, { newModelId?: string }>;
 }
 
 // --- Response Models ---

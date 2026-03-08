@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach } from 'vitest';
-import { StreamingState } from '../../lib/antigravity/ClaudeStreamingMapper';
+import { PartProcessor, StreamingState } from '../../lib/antigravity/ClaudeStreamingMapper';
 
 describe('StreamingState', () => {
   let state: StreamingState;
@@ -56,6 +56,50 @@ describe('StreamingState', () => {
       expect(state.getErrorCount()).toBe(1);
       state.handleParseError('error 2');
       expect(state.getErrorCount()).toBe(2);
+    });
+  });
+
+  describe('stream aggregation compatibility', () => {
+    it('emits tool_use stop reason when functionCall appears in stream', () => {
+      const processor = new PartProcessor(state);
+      const functionChunks = processor.process({
+        functionCall: {
+          name: 'builtin_web_search',
+          args: { query: 'gemini docs' },
+          id: 'call_stream_1',
+        },
+      });
+      const finishChunks = state.emitFinish('STOP', {
+        promptTokenCount: 2,
+        candidatesTokenCount: 3,
+      } as any);
+
+      const output = [...functionChunks, ...finishChunks].join('');
+      expect(output).toContain('"type":"tool_use"');
+      expect(output).toContain('"stop_reason":"tool_use"');
+      expect(output).toContain('"message_stop"');
+    });
+
+    it('aggregates grounding metadata into final text block', () => {
+      state.webSearchQuery = 'gemini api';
+      state.groundingChunks = [
+        {
+          web: {
+            title: 'Gemini API Docs',
+            uri: 'https://example.com/gemini',
+          },
+        },
+      ];
+
+      const chunks = state.emitFinish('STOP', {
+        promptTokenCount: 1,
+        candidatesTokenCount: 1,
+      } as any);
+      const output = chunks.join('');
+
+      expect(output).toContain('Searched for you');
+      expect(output).toContain('Citations');
+      expect(output).toContain('https://example.com/gemini');
     });
   });
 });

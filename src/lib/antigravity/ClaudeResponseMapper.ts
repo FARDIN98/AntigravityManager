@@ -165,21 +165,21 @@ class NonStreamingProcessor {
     let groundingText = '';
 
     if (grounding.webSearchQueries && grounding.webSearchQueries.length > 0) {
-      groundingText += `\n\n---\n**🔍 已为您搜索：** ${grounding.webSearchQueries.join(', ')}`;
+      groundingText += `\n\n---\n**🔍 Searched for you:** ${grounding.webSearchQueries.join(', ')}`;
     }
 
     if (grounding.groundingChunks) {
       const links: string[] = [];
       grounding.groundingChunks.forEach((chunk, index) => {
         if (chunk.web) {
-          const title = chunk.web.title || '网页来源';
+          const title = chunk.web.title || 'Web source';
           const uri = chunk.web.uri || '#';
           links.push(`[${index + 1}] [${title}](${uri})`);
         }
       });
 
       if (links.length > 0) {
-        groundingText += `\n\n**🌐 来源引文：**\n` + links.join('\n');
+        groundingText += `\n\n**🌐 Citations:**\n` + links.join('\n');
       }
     }
 

@@ -1,7 +1,10 @@
 import { Injectable, Logger, OnModuleInit } from '@nestjs/common';
 import { CloudAccountRepo } from '../../../ipc/database/cloudHandler';
-import { CloudAccount } from '../../../types/cloudAccount';
+import { CloudAccount, CloudQuotaData } from '../../../types/cloudAccount';
 import { GoogleAPIService } from '../../../services/GoogleAPIService';
+import { getServerConfig } from '../../server-config';
+import { RateLimitReason, RateLimitTracker } from './rate-limit-tracker';
+import { updateDynamicForwardingRules } from '../../../lib/antigravity/ModelMapping';
 
 interface TokenData {
   email: string;
@@ -14,7 +17,22 @@ interface TokenData {
   project_id?: string;
   session_id?: string;
   upstream_proxy_url?: string;
+  quota?: CloudQuotaData;
+  model_quotas: Record<string, number>;
+  model_limits: Record<string, number>;
+  model_reset_times: Record<string, string>;
+  model_forwarding_rules: Record<string, string>;
 }
+
+type SchedulingMode = 'cache-first' | 'balance' | 'performance-first';
+
+interface GetNextTokenOptions {
+  sessionKey?: string;
+  excludeAccountIds?: string[];
+  model?: string;
+}
+
+type TokenEntry = [string, TokenData];
 
 function normalizeProjectId(projectId: string | null | undefined): string | undefined {
   if (typeof projectId !== 'string') {
@@ -26,13 +44,25 @@ function normalizeProjectId(projectId: string | null | undefined): string | unde
     return undefined;
   }
 
-  // Legacy upgrades may carry malformed resource names (e.g. "projects/").
-  // The internal gateway expects a plain project id, not a resource path.
   if (/^projects(?:\/.*)?$/i.test(trimmedProjectId)) {
     return undefined;
   }
 
   return trimmedProjectId;
+}
+
+function normalizeModelId(modelId: string | null | undefined): string | undefined {
+  if (typeof modelId !== 'string') {
+    return undefined;
+  }
+  const normalized = modelId.replace(/^models\//i, '').trim();
+  return normalized !== '' ? normalized : undefined;
+}
+
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => {
+    setTimeout(resolve, ms);
+  });
 }
 
 @Injectable()
@@ -43,14 +73,20 @@ export class TokenManagerService implements OnModuleInit {
   private readonly stickySessionTtlMs = 10 * 60 * 1000;
   private readonly rateLimitCooldownMs = 5 * 60 * 1000;
   private readonly forbiddenCooldownMs = 30 * 60 * 1000;
-  // In-memory cache of tokens with additional data
+  private readonly defaultBackoffSteps = [60, 300, 1800, 7200];
+
   private tokens: Map<string, TokenData> = new Map();
-  // Cooldown map for rate-limited accounts
-  private cooldowns: Map<string, number> = new Map();
+  private accountCooldowns: Map<string, number> = new Map();
   private sessionBindings: Map<string, { accountId: string; expiresAt: number }> = new Map();
+  private rateLimitTracker = new RateLimitTracker();
+
+  private shadowComparisonCount = 0;
+  private shadowMismatchCount = 0;
+  private parityRequestCount = 0;
+  private parityErrorCount = 0;
+  private noGoBlocked = false;
 
   async onModuleInit() {
-    // Load accounts on module initialization
     await this.loadAccounts();
   }
 
@@ -59,24 +95,659 @@ export class TokenManagerService implements OnModuleInit {
       const accounts = await CloudAccountRepo.getAccounts();
       let count = 0;
 
+      this.tokens.clear();
+
       for (const account of accounts) {
-        const tokenData = this.convertAccountToToken(account);
+        const tokenData = this.mapAccountToTokenData(account);
         if (tokenData) {
           this.tokens.set(account.id, tokenData);
           count++;
         }
       }
 
-      this.logger.log(`Initialized token pool with ${count} accounts`);
+      this.logger.log(`Token manager loaded ${count} cloud accounts into cache`);
       return count;
     } catch (e) {
-      this.logger.error('Unable to load accounts', e);
+      this.logger.error('Failed to load cloud accounts into token cache', e);
       return 0;
     }
   }
 
-  private convertAccountToToken(account: CloudAccount): TokenData | null {
-    if (!account.token) return null;
+  async reloadAllAccounts(): Promise<number> {
+    const count = await this.loadAccounts();
+    this.clearAllRateLimits();
+    this.clearAllSessions();
+    return count;
+  }
+
+  clearAllSessions(): void {
+    this.sessionBindings.clear();
+  }
+
+  clearAllRateLimits(): void {
+    this.accountCooldowns.clear();
+    this.rateLimitTracker.clearAll();
+  }
+
+  recordParityError(): void {
+    if (!this.isParitySchedulingEnabled()) {
+      return;
+    }
+
+    this.parityErrorCount++;
+    const threshold = this.getNoGoErrorRateThreshold();
+    const errorRate = this.parityErrorCount / Math.max(1, this.parityRequestCount);
+    if (errorRate > threshold) {
+      this.noGoBlocked = true;
+      this.logger.error(
+        `Parity no-go triggered by error threshold: rate=${errorRate.toFixed(4)}, requests=${this.parityRequestCount}, errors=${this.parityErrorCount}`,
+      );
+    }
+  }
+
+  setPreferredAccount(accountId?: string): void {
+    const config = getServerConfig();
+    if (!config) {
+      return;
+    }
+    config.preferred_account_id = accountId ?? '';
+  }
+
+  isRateLimited(accountIdOrEmail: string, model?: string): boolean {
+    const accountId = this.resolveAccountId(accountIdOrEmail) ?? accountIdOrEmail;
+    const now = Date.now();
+    const legacyCooldownUntil = this.accountCooldowns.get(accountId);
+    if (legacyCooldownUntil && legacyCooldownUntil > now) {
+      return true;
+    }
+    return this.rateLimitTracker.isRateLimited(accountId, model);
+  }
+
+  markAsRateLimited(accountIdOrEmail: string) {
+    this.setAccountCooldown(accountIdOrEmail, 'rate limited', this.rateLimitCooldownMs);
+  }
+
+  markAsForbidden(accountIdOrEmail: string) {
+    this.setAccountCooldown(accountIdOrEmail, 'forbidden', this.forbiddenCooldownMs);
+  }
+
+  async markFromUpstreamError(params: {
+    accountIdOrEmail: string;
+    status?: number;
+    retryAfter?: string;
+    body?: string;
+    model?: string;
+  }): Promise<void> {
+    const accountId = this.resolveAccountId(params.accountIdOrEmail) ?? params.accountIdOrEmail;
+    const normalizedModel = normalizeModelId(params.model);
+    const hasExplicitRetryWindow =
+      Boolean(params.retryAfter && params.retryAfter.trim() !== '') ||
+      Boolean(params.body && params.body.includes('quotaResetDelay'));
+
+    if (!hasExplicitRetryWindow && (params.status ?? 0) === 429) {
+      const reason = this.detectRateLimitReasonFromBody(params.body);
+      const shouldAttemptPreciseLockout =
+        reason === RateLimitReason.QuotaExhausted || reason === RateLimitReason.Unknown;
+
+      if (!shouldAttemptPreciseLockout) {
+        const parsed = this.rateLimitTracker.trackFromUpstreamError({
+          accountId,
+          status: params.status,
+          retryAfter: params.retryAfter,
+          body: params.body,
+          model: normalizedModel,
+          backoffSteps: this.getCircuitBreakerBackoffSteps(),
+        });
+
+        if (!parsed) {
+          return;
+        }
+
+        if (
+          parsed.reason !== RateLimitReason.QuotaExhausted ||
+          !parsed.model ||
+          parsed.model.trim() === ''
+        ) {
+          this.accountCooldowns.set(accountId, Date.now() + parsed.retryAfterSec * 1000);
+        }
+        return;
+      }
+
+      const isLockedByRealtimeQuota = await this.refreshRealtimeQuotaAndSetPreciseLockout(
+        accountId,
+        reason,
+        normalizedModel,
+      );
+      if (isLockedByRealtimeQuota) {
+        return;
+      }
+
+      const isLockedByQuotaCache = this.setPreciseLockoutFromCachedQuota(
+        accountId,
+        reason,
+        normalizedModel,
+      );
+      if (isLockedByQuotaCache) {
+        return;
+      }
+    }
+
+    const parsed = this.rateLimitTracker.trackFromUpstreamError({
+      accountId,
+      status: params.status,
+      retryAfter: params.retryAfter,
+      body: params.body,
+      model: normalizedModel,
+      backoffSteps: this.getCircuitBreakerBackoffSteps(),
+    });
+
+    if (!parsed) {
+      return;
+    }
+
+    // Keep legacy account-level cooldown for reasons that affect the full account.
+    if (
+      parsed.reason !== RateLimitReason.QuotaExhausted ||
+      !parsed.model ||
+      parsed.model.trim() === ''
+    ) {
+      this.accountCooldowns.set(accountId, Date.now() + parsed.retryAfterSec * 1000);
+    }
+
+    this.logger.warn(
+      `Recorded upstream limit for account ${accountId}: reason=${parsed.reason}, wait=${parsed.retryAfterSec}s, model=${parsed.model ?? 'n/a'}`,
+    );
+  }
+
+  async getNextToken(options?: GetNextTokenOptions): Promise<CloudAccount | null> {
+    try {
+      if (this.tokens.size === 0) {
+        await this.loadAccounts();
+      }
+      if (this.tokens.size === 0) {
+        return null;
+      }
+
+      const now = Date.now();
+      const nowSeconds = Math.floor(now / 1000);
+      const sessionKey = options?.sessionKey?.trim();
+      const model = options?.model;
+      const excludedAccountIds = new Set(options?.excludeAccountIds ?? []);
+
+      this.clearExpiredSessionBindings(now);
+      this.rateLimitTracker.cleanupExpired();
+
+      const fullAccountPool = Array.from(this.tokens.entries());
+      const filteredAccountPool = fullAccountPool.filter(
+        ([accountId]) => !excludedAccountIds.has(accountId),
+      );
+      const candidateAccountPool =
+        filteredAccountPool.length > 0 ? filteredAccountPool : fullAccountPool;
+
+      if (filteredAccountPool.length === 0 && excludedAccountIds.size > 0) {
+        this.logger.warn(
+          'Exclusion filter removed all accounts; retrying with the full account pool',
+        );
+      }
+
+      if (candidateAccountPool.length === 0) {
+        this.logger.warn('No eligible account found after exclusion filtering');
+        return null;
+      }
+
+      if (this.shouldExecuteShadowComparison()) {
+        this.executeShadowComparison(candidateAccountPool, sessionKey, model);
+      }
+
+      const selectedTokenEntry = this.isParitySchedulingEnabled()
+        ? await this.selectParityTokenCandidate(candidateAccountPool, sessionKey, model, now)
+        : this.selectLegacyTokenCandidate(candidateAccountPool, sessionKey, now);
+
+      if (!selectedTokenEntry) {
+        return null;
+      }
+
+      if (this.isParitySchedulingEnabled()) {
+        this.parityRequestCount++;
+      }
+
+      const [accountId, tokenData] = selectedTokenEntry;
+      return this.finalizeSelectedToken(accountId, tokenData, nowSeconds, sessionKey);
+    } catch (error) {
+      this.logger.error('Failed to select the next account token', error);
+      return null;
+    }
+  }
+
+  private shouldExecuteShadowComparison(): boolean {
+    const config = getServerConfig();
+    return (
+      Boolean(config?.parity_shadow_enabled) &&
+      !this.isParitySchedulingEnabled() &&
+      !this.noGoBlocked
+    );
+  }
+
+  private isParitySchedulingEnabled(): boolean {
+    const config = getServerConfig();
+    if (!config) {
+      return false;
+    }
+    if (config.parity_kill_switch) {
+      return false;
+    }
+    if (this.noGoBlocked) {
+      return false;
+    }
+    return Boolean(config.parity_enabled);
+  }
+
+  private getSchedulingMode(): SchedulingMode {
+    const config = getServerConfig();
+    const mode = (config?.scheduling_mode ?? 'balance').toLowerCase();
+    if (mode === 'cache-first' || mode === 'performance-first' || mode === 'balance') {
+      return mode;
+    }
+    return 'balance';
+  }
+
+  private getMaxWaitDurationMs(): number {
+    const config = getServerConfig();
+    const seconds = config?.max_wait_seconds ?? 60;
+    return Math.max(0, seconds) * 1000;
+  }
+
+  private getCircuitBreakerBackoffSteps(): number[] {
+    const config = getServerConfig();
+    const configured = config?.circuit_breaker_backoff_steps ?? this.defaultBackoffSteps;
+    const normalized = configured
+      .map((value) => Number(value))
+      .filter((value) => Number.isFinite(value) && value > 0)
+      .map((value) => Math.ceil(value));
+    if (normalized.length > 0) {
+      return normalized;
+    }
+    return this.defaultBackoffSteps;
+  }
+
+  private getPreferredAccountId(): string | undefined {
+    const config = getServerConfig();
+    const preferred = config?.preferred_account_id?.trim();
+    return preferred ? preferred : undefined;
+  }
+
+  private getNoGoMismatchRateThreshold(): number {
+    const config = getServerConfig();
+    const threshold = config?.parity_no_go_mismatch_rate ?? 0.15;
+    if (!Number.isFinite(threshold)) {
+      return 0.15;
+    }
+    return Math.min(1, Math.max(0, threshold));
+  }
+
+  private getNoGoErrorRateThreshold(): number {
+    const config = getServerConfig();
+    const threshold = config?.parity_no_go_error_rate ?? 0.4;
+    if (!Number.isFinite(threshold)) {
+      return 0.4;
+    }
+    return Math.min(1, Math.max(0, threshold));
+  }
+
+  private collectEligibleTokens(
+    allTokens: TokenEntry[],
+    model: string | undefined,
+    now: number,
+  ): TokenEntry[] {
+    return allTokens.filter(([accountId]) => {
+      const cooldownUntil = this.accountCooldowns.get(accountId);
+      if (cooldownUntil && cooldownUntil > now) {
+        return false;
+      }
+      return !this.rateLimitTracker.isRateLimited(accountId, model);
+    });
+  }
+
+  private getValidSessionBinding(
+    sessionKey: string | undefined,
+    now: number,
+  ): { accountId: string; expiresAt: number } | null {
+    if (!sessionKey) {
+      return null;
+    }
+    const stickyBinding = this.sessionBindings.get(sessionKey);
+    if (!stickyBinding || stickyBinding.expiresAt <= now) {
+      return null;
+    }
+    return stickyBinding;
+  }
+
+  private findStickySessionToken(
+    candidates: TokenEntry[],
+    sessionKey: string | undefined,
+    now: number,
+  ): TokenEntry | null {
+    const stickyBinding = this.getValidSessionBinding(sessionKey, now);
+    if (!stickyBinding) {
+      return null;
+    }
+
+    return candidates.find(([accountId]) => accountId === stickyBinding.accountId) ?? null;
+  }
+
+  private pickRoundRobinEntry(candidates: TokenEntry[]): TokenEntry | null {
+    if (candidates.length === 0) {
+      return null;
+    }
+    const picked = candidates[this.currentIndex % candidates.length];
+    this.currentIndex++;
+    return picked;
+  }
+
+  private peekRoundRobinCandidateAccountId(candidates: TokenEntry[]): string | null {
+    if (candidates.length === 0) {
+      return null;
+    }
+    return candidates[this.currentIndex % candidates.length][0];
+  }
+
+  private selectLegacyTokenCandidate(
+    allTokens: TokenEntry[],
+    sessionKey: string | undefined,
+    now: number,
+  ): TokenEntry | null {
+    const availableByCooldown = allTokens.filter(([accountId]) => {
+      const cooldownUntil = this.accountCooldowns.get(accountId);
+      return !cooldownUntil || cooldownUntil <= now;
+    });
+
+    const candidateAccountPool = availableByCooldown.length > 0 ? availableByCooldown : allTokens;
+    if (candidateAccountPool.length === 0) {
+      return null;
+    }
+
+    if (availableByCooldown.length === 0) {
+      this.logger.warn(
+        'All accounts are cooling down; temporarily bypassing cooldown gate to preserve availability',
+      );
+    }
+
+    const stickyToken = this.findStickySessionToken(candidateAccountPool, sessionKey, now);
+    if (stickyToken) {
+      return stickyToken;
+    }
+
+    return this.pickRoundRobinEntry(candidateAccountPool);
+  }
+
+  private async selectParityTokenCandidate(
+    allTokens: TokenEntry[],
+    sessionKey: string | undefined,
+    model: string | undefined,
+    now: number,
+  ): Promise<TokenEntry | null> {
+    const mode = this.getSchedulingMode();
+    const availableTokens = this.collectEligibleTokens(allTokens, model, now);
+    if (availableTokens.length === 0) {
+      return null;
+    }
+
+    const preferredAccountId = this.getPreferredAccountId();
+    if (preferredAccountId) {
+      const preferred = availableTokens.find(([accountId]) => accountId === preferredAccountId);
+      if (preferred) {
+        return preferred;
+      }
+    }
+
+    const stickyToken = this.findStickySessionToken(availableTokens, sessionKey, now);
+    if (stickyToken) {
+      return stickyToken;
+    }
+
+    const stickyBinding = this.getValidSessionBinding(sessionKey, now);
+    if (stickyBinding && mode === 'cache-first') {
+      const waitSec = this.rateLimitTracker.getRemainingWaitSeconds(
+        stickyBinding.accountId,
+        model,
+      );
+      const waitMs = waitSec * 1000;
+      const maxWaitMs = this.getMaxWaitDurationMs();
+      if (waitMs > 0 && waitMs <= maxWaitMs) {
+        await delay(waitMs);
+        const refreshedAvailable = this.collectEligibleTokens(allTokens, model, Date.now());
+        const stickyAfterWait =
+          refreshedAvailable.find(([accountId]) => accountId === stickyBinding.accountId) ?? null;
+        if (stickyAfterWait) {
+          return stickyAfterWait;
+        }
+        if (refreshedAvailable.length > 0) {
+          return this.pickRoundRobinEntry(refreshedAvailable);
+        }
+      }
+    }
+
+    return this.pickRoundRobinEntry(availableTokens);
+  }
+
+  private predictLegacyAccountCandidateId(
+    allTokens: TokenEntry[],
+    sessionKey: string | undefined,
+    now: number,
+  ): string | null {
+    const availableByCooldown = allTokens.filter(([accountId]) => {
+      const cooldownUntil = this.accountCooldowns.get(accountId);
+      return !cooldownUntil || cooldownUntil <= now;
+    });
+    const candidateAccountPool = availableByCooldown.length > 0 ? availableByCooldown : allTokens;
+    if (candidateAccountPool.length === 0) {
+      return null;
+    }
+
+    const stickyToken = this.findStickySessionToken(candidateAccountPool, sessionKey, now);
+    if (stickyToken) {
+      return stickyToken[0];
+    }
+
+    return this.peekRoundRobinCandidateAccountId(candidateAccountPool);
+  }
+
+  private predictParityAccountCandidateId(
+    allTokens: TokenEntry[],
+    sessionKey: string | undefined,
+    model: string | undefined,
+    now: number,
+  ): string | null {
+    const availableTokens = this.collectEligibleTokens(allTokens, model, now);
+    if (availableTokens.length === 0) {
+      return null;
+    }
+
+    const preferredAccountId = this.getPreferredAccountId();
+    if (preferredAccountId) {
+      const preferred = availableTokens.find(([accountId]) => accountId === preferredAccountId);
+      if (preferred) {
+        return preferred[0];
+      }
+    }
+
+    const stickyToken = this.findStickySessionToken(availableTokens, sessionKey, now);
+    if (stickyToken) {
+      return stickyToken[0];
+    }
+
+    return this.peekRoundRobinCandidateAccountId(availableTokens);
+  }
+
+  private executeShadowComparison(
+    allTokens: TokenEntry[],
+    sessionKey: string | undefined,
+    model: string | undefined,
+  ): void {
+    const now = Date.now();
+    const legacyAccountId = this.predictLegacyAccountCandidateId(allTokens, sessionKey, now);
+    const parityAccountId = this.predictParityAccountCandidateId(
+      allTokens,
+      sessionKey,
+      model,
+      now,
+    );
+    this.shadowComparisonCount++;
+
+    if (legacyAccountId !== parityAccountId) {
+      this.shadowMismatchCount++;
+      this.logger.warn(
+        `Parity shadow mismatch detected: legacy=${legacyAccountId ?? 'n/a'}, parity=${parityAccountId ?? 'n/a'}`,
+      );
+    }
+
+    const mismatchRate = this.shadowMismatchCount / Math.max(1, this.shadowComparisonCount);
+    if (mismatchRate > this.getNoGoMismatchRateThreshold()) {
+      this.noGoBlocked = true;
+      this.logger.error(
+        `Parity no-go triggered by mismatch threshold: rate=${mismatchRate.toFixed(4)}, comparisons=${this.shadowComparisonCount}`,
+      );
+    }
+  }
+
+  private detectRateLimitReasonFromBody(body: string | undefined): RateLimitReason {
+    const lowerBody = (body ?? '').toLowerCase();
+    if (lowerBody.includes('model_capacity')) {
+      return RateLimitReason.ModelCapacityExhausted;
+    }
+    if (lowerBody.includes('exhausted') || lowerBody.includes('quota')) {
+      return RateLimitReason.QuotaExhausted;
+    }
+    if (
+      lowerBody.includes('per minute') ||
+      lowerBody.includes('rate limit') ||
+      lowerBody.includes('rate_limit')
+    ) {
+      return RateLimitReason.RateLimitExceeded;
+    }
+    return RateLimitReason.Unknown;
+  }
+
+  private extractQuotaSnapshot(quota: CloudQuotaData | undefined): {
+    modelQuotas: Record<string, number>;
+    modelLimits: Record<string, number>;
+    modelResetTimes: Record<string, string>;
+    modelForwardingRules: Record<string, string>;
+  } {
+    const modelQuotas: Record<string, number> = {};
+    const modelLimits: Record<string, number> = {};
+    const modelResetTimes: Record<string, string> = {};
+    const modelForwardingRules: Record<string, string> = {};
+
+    for (const [modelName, modelInfo] of Object.entries(quota?.models ?? {})) {
+      const normalizedModel = normalizeModelId(modelName);
+      if (!normalizedModel) {
+        continue;
+      }
+
+      if (Number.isFinite(modelInfo.percentage)) {
+        modelQuotas[normalizedModel] = Math.floor(modelInfo.percentage);
+      }
+
+      const limitCandidate = modelInfo.max_output_tokens ?? modelInfo.max_tokens;
+      if (
+        typeof limitCandidate === 'number' &&
+        Number.isFinite(limitCandidate) &&
+        limitCandidate > 0
+      ) {
+        modelLimits[normalizedModel] = Math.floor(limitCandidate);
+      }
+
+      if (typeof modelInfo.resetTime === 'string' && modelInfo.resetTime.trim() !== '') {
+        modelResetTimes[normalizedModel] = modelInfo.resetTime;
+      }
+    }
+
+    for (const [oldModel, newModel] of Object.entries(quota?.model_forwarding_rules ?? {})) {
+      const normalizedOld = normalizeModelId(oldModel);
+      const normalizedNew = normalizeModelId(newModel);
+      if (!normalizedOld || !normalizedNew) {
+        continue;
+      }
+      modelForwardingRules[normalizedOld] = normalizedNew;
+      updateDynamicForwardingRules(normalizedOld, normalizedNew);
+    }
+
+    return {
+      modelQuotas,
+      modelLimits,
+      modelResetTimes,
+      modelForwardingRules,
+    };
+  }
+
+  private findEarliestQuotaResetTime(modelResetTimes: Record<string, string>): string | null {
+    const validTimes = Object.values(modelResetTimes).filter((value) => value.trim() !== '');
+    if (validTimes.length === 0) {
+      return null;
+    }
+    return [...validTimes].sort()[0];
+  }
+
+  private setPreciseLockoutFromCachedQuota(
+    accountId: string,
+    reason: RateLimitReason,
+    model?: string,
+  ): boolean {
+    const tokenData = this.tokens.get(accountId);
+    if (!tokenData) {
+      return false;
+    }
+
+    const resetTime = this.findEarliestQuotaResetTime(tokenData.model_reset_times);
+    if (!resetTime) {
+      return false;
+    }
+
+    return this.rateLimitTracker.setLockoutUntilIso(accountId, resetTime, reason, model);
+  }
+
+  private async refreshRealtimeQuotaAndSetPreciseLockout(
+    accountId: string,
+    reason: RateLimitReason,
+    model?: string,
+  ): Promise<boolean> {
+    const tokenData = this.tokens.get(accountId);
+    if (!tokenData) {
+      return false;
+    }
+
+    try {
+      const latestQuota = await GoogleAPIService.fetchQuota(tokenData.access_token);
+      const extractedState = this.extractQuotaSnapshot(latestQuota);
+
+      tokenData.quota = latestQuota;
+      tokenData.model_quotas = extractedState.modelQuotas;
+      tokenData.model_limits = extractedState.modelLimits;
+      tokenData.model_reset_times = extractedState.modelResetTimes;
+      tokenData.model_forwarding_rules = extractedState.modelForwardingRules;
+      this.tokens.set(accountId, tokenData);
+
+      await CloudAccountRepo.updateQuota(accountId, latestQuota);
+
+      const resetTime = this.findEarliestQuotaResetTime(extractedState.modelResetTimes);
+      if (!resetTime) {
+        return false;
+      }
+      return this.rateLimitTracker.setLockoutUntilIso(accountId, resetTime, reason, model);
+    } catch (error) {
+      this.logger.warn(`Failed to refresh realtime quota for account ${accountId}`, error);
+      return false;
+    }
+  }
+
+  private mapAccountToTokenData(account: CloudAccount): TokenData | null {
+    if (!account.token) {
+      return null;
+    }
+
+    const quota = account.quota;
+    const extractedState = this.extractQuotaSnapshot(quota);
 
     return {
       account_id: account.id,
@@ -89,6 +760,11 @@ export class TokenManagerService implements OnModuleInit {
       project_id: account.token.project_id || undefined,
       session_id: account.token.session_id || this.generateSessionId(),
       upstream_proxy_url: account.token.upstream_proxy_url || undefined,
+      quota,
+      model_quotas: extractedState.modelQuotas,
+      model_limits: extractedState.modelLimits,
+      model_reset_times: extractedState.modelResetTimes,
+      model_forwarding_rules: extractedState.modelForwardingRules,
     };
   }
 
@@ -100,84 +776,6 @@ export class TokenManagerService implements OnModuleInit {
     return (-(min + rand)).toString();
   }
 
-  async getNextToken(options?: {
-    sessionKey?: string;
-    excludeAccountIds?: string[];
-  }): Promise<CloudAccount | null> {
-    try {
-      // Reload if empty
-      if (this.tokens.size === 0) {
-        await this.loadAccounts();
-      }
-      if (this.tokens.size === 0) return null;
-
-      const now = Date.now();
-      const nowSeconds = Math.floor(now / 1000);
-      const sessionKey = options?.sessionKey?.trim();
-      const excludedAccountIds = new Set(options?.excludeAccountIds ?? []);
-
-      this.clearExpiredSessionBindings(now);
-
-      const fullTokenPool = Array.from(this.tokens.entries());
-      const excludedFilteredTokens = fullTokenPool.filter(
-        ([accountId]) => !excludedAccountIds.has(accountId),
-      );
-      const allTokens = excludedFilteredTokens.length > 0 ? excludedFilteredTokens : fullTokenPool;
-      if (excludedFilteredTokens.length === 0 && excludedAccountIds.size > 0) {
-        this.logger.warn(
-          'Retry exclusions removed all accounts; temporarily reusing excluded accounts',
-        );
-      }
-
-      // Filter out accounts in cooldown
-      const validTokens = allTokens.filter(([accountId]) => {
-        if (excludedAccountIds.has(accountId)) {
-          return false;
-        }
-
-        const cooldownUntil = this.cooldowns.get(accountId);
-        return !cooldownUntil || cooldownUntil <= now;
-      });
-
-      const candidateTokens = validTokens.length > 0 ? validTokens : allTokens;
-      if (candidateTokens.length === 0) {
-        this.logger.warn('No account available after applying exclusions');
-        return null;
-      }
-      if (validTokens.length === 0) {
-        this.logger.warn(
-          'All accounts are currently in cooldown; temporarily bypassing cooldown to keep service available',
-        );
-      }
-
-      if (sessionKey) {
-        const stickyBinding = this.sessionBindings.get(sessionKey);
-        if (stickyBinding && stickyBinding.expiresAt > now) {
-          const stickyMatch = candidateTokens.find(
-            ([accountId]) => accountId === stickyBinding.accountId,
-          );
-          if (stickyMatch) {
-            const [stickyAccountId, stickyTokenData] = stickyMatch;
-            return this.finalizeSelectedToken(
-              stickyAccountId,
-              stickyTokenData,
-              nowSeconds,
-              sessionKey,
-            );
-          }
-        }
-      }
-
-      // Round robin selection
-      const [accountId, tokenData] = candidateTokens[this.currentIndex % candidateTokens.length];
-      this.currentIndex++;
-      return this.finalizeSelectedToken(accountId, tokenData, nowSeconds, sessionKey);
-    } catch (error) {
-      this.logger.error('Unable to acquire token', error);
-      return null;
-    }
-  }
-
   private async finalizeSelectedToken(
     accountId: string,
     tokenData: TokenData,
@@ -187,24 +785,18 @@ export class TokenManagerService implements OnModuleInit {
     try {
       let effectiveProjectId: string | undefined;
 
-      // Check if token needs refresh (expires in < 5 minutes)
       if (nowSeconds >= tokenData.expiry_timestamp - 300) {
-        this.logger.log(`Token for ${tokenData.email} is close to expiry; refreshing...`);
+        this.logger.log(`Access token near expiry for ${tokenData.email}; refreshing`);
         try {
           const newTokens = await GoogleAPIService.refreshAccessToken(tokenData.refresh_token);
-
-          // Update token data
           tokenData.access_token = newTokens.access_token;
           tokenData.expires_in = newTokens.expires_in;
           tokenData.expiry_timestamp = nowSeconds + newTokens.expires_in;
-
-          // Save to DB
-          await this.saveTokenState(accountId, tokenData);
+          await this.persistTokenState(accountId, tokenData);
           this.tokens.set(accountId, tokenData);
-
-          this.logger.log(`Refreshed token for ${tokenData.email}`);
+          this.logger.log(`Access token refreshed for ${tokenData.email}`);
         } catch (e) {
-          this.logger.error(`Unable to refresh token for ${tokenData.email}`, e);
+          this.logger.error(`Failed to refresh access token for ${tokenData.email}`, e);
         }
       }
 
@@ -217,32 +809,32 @@ export class TokenManagerService implements OnModuleInit {
         try {
           const fetchedProjectId = await GoogleAPIService.fetchProjectId(tokenData.access_token);
           const normalizedProjectId = normalizeProjectId(fetchedProjectId);
-
           if (normalizedProjectId) {
             tokenData.project_id = normalizedProjectId;
             effectiveProjectId = normalizedProjectId;
-            await this.saveTokenState(accountId, tokenData);
+            await this.persistTokenState(accountId, tokenData);
             this.tokens.set(accountId, tokenData);
             this.logger.log(`Resolved project ID for ${tokenData.email}: ${normalizedProjectId}`);
           } else {
             this.logger.warn(
-              `Project ID is unavailable for ${tokenData.email}; request will continue without project context`,
+              `Project ID unavailable for ${tokenData.email}; continuing without project context`,
             );
           }
         } catch (error) {
-          this.logger.warn(`Failed to resolve project ID for ${tokenData.email}`, error);
+          this.logger.warn(`Unable to resolve project ID for ${tokenData.email}`, error);
         }
       }
 
       if (!effectiveProjectId) {
-        const fallbackProjectId = this.getFallbackProjectId();
+        const fallbackProjectId = this.resolveFallbackProjectId();
         effectiveProjectId = fallbackProjectId;
         this.logger.warn(
-          `Using fallback project ID for ${tokenData.email} without persistence: ${fallbackProjectId}`,
+          `Using non-persistent fallback project ID for ${tokenData.email}: ${fallbackProjectId}`,
         );
       }
 
-      this.logger.log(`Using account: ${tokenData.email}`);
+      this.rateLimitTracker.markSuccess(accountId);
+
       if (sessionKey) {
         this.sessionBindings.set(sessionKey, {
           accountId,
@@ -250,9 +842,8 @@ export class TokenManagerService implements OnModuleInit {
         });
       }
 
-      // Return in CloudAccount format for compatibility
       const timestamp = Date.now();
-      const cloudAccount: CloudAccount = {
+      return {
         id: accountId,
         provider: 'google',
         email: tokenData.email,
@@ -269,19 +860,10 @@ export class TokenManagerService implements OnModuleInit {
         created_at: timestamp,
         last_used: timestamp,
       };
-      return cloudAccount;
     } catch (error) {
-      this.logger.error('Unable to finalize selected token', error);
+      this.logger.error('Failed to finalize selected account token', error);
       return null;
     }
-  }
-
-  markAsRateLimited(accountIdOrEmail: string) {
-    this.markInCooldown(accountIdOrEmail, 'rate limited', this.rateLimitCooldownMs);
-  }
-
-  markAsForbidden(accountIdOrEmail: string) {
-    this.markInCooldown(accountIdOrEmail, 'forbidden', this.forbiddenCooldownMs);
   }
 
   private resolveAccountId(accountIdOrEmail: string): string | null {
@@ -306,7 +888,7 @@ export class TokenManagerService implements OnModuleInit {
     }
   }
 
-  private markInCooldown(
+  private setAccountCooldown(
     accountIdOrEmail: string,
     reason: 'rate limited' | 'forbidden',
     durationMs: number,
@@ -314,13 +896,13 @@ export class TokenManagerService implements OnModuleInit {
     const accountId = this.resolveAccountId(accountIdOrEmail) ?? accountIdOrEmail;
     const cooldownUntil = Date.now() + durationMs;
 
-    this.cooldowns.set(accountId, cooldownUntil);
+    this.accountCooldowns.set(accountId, cooldownUntil);
     this.logger.warn(
-      `Account ${accountIdOrEmail} (cooldown key: ${accountId}) set to ${reason} until ${new Date(cooldownUntil).toISOString()}`,
+      `Applied ${reason} cooldown: source=${accountIdOrEmail}, accountId=${accountId}, until=${new Date(cooldownUntil).toISOString()}`,
     );
   }
 
-  private async saveTokenState(accountId: string, tokenData: TokenData) {
+  private async persistTokenState(accountId: string, tokenData: TokenData) {
     try {
       const acc = await CloudAccountRepo.getAccount(accountId);
       if (acc && acc.token) {
@@ -336,18 +918,53 @@ export class TokenManagerService implements OnModuleInit {
         await CloudAccountRepo.updateToken(accountId, newToken);
       }
     } catch (e) {
-      this.logger.error('Unable to persist token state to DB', e);
+      this.logger.error('Failed to persist token state to database', e);
     }
   }
 
-  /**
-   * Get the number of loaded accounts (for status)
-   */
   getAccountCount(): number {
     return this.tokens.size;
   }
 
-  private getFallbackProjectId(): string {
+  getAllCollectedModels(): Set<string> {
+    const allModels = new Set<string>();
+    for (const tokenData of this.tokens.values()) {
+      for (const modelId of Object.keys(tokenData.model_quotas)) {
+        allModels.add(modelId);
+      }
+    }
+    return allModels;
+  }
+
+  getModelOutputLimitForAccount(accountId: string, modelName: string): number | undefined {
+    const tokenData = this.tokens.get(accountId);
+    const normalizedModel = normalizeModelId(modelName);
+    if (!tokenData || !normalizedModel) {
+      return undefined;
+    }
+    return tokenData.model_limits[normalizedModel];
+  }
+
+  getModelThinkingBudgetForAccount(accountId: string, modelName: string): number | undefined {
+    const tokenData = this.tokens.get(accountId);
+    const normalizedModel = normalizeModelId(modelName);
+    if (!tokenData || !normalizedModel) {
+      return undefined;
+    }
+
+    for (const [quotaModelName, modelInfo] of Object.entries(tokenData.quota?.models ?? {})) {
+      if (normalizeModelId(quotaModelName) !== normalizedModel) {
+        continue;
+      }
+      const budget = modelInfo?.thinking_budget;
+      if (typeof budget === 'number' && Number.isFinite(budget) && budget >= 0) {
+        return Math.floor(budget);
+      }
+    }
+    return undefined;
+  }
+
+  private resolveFallbackProjectId(): string {
     const fromEnv = process.env.PROXY_FALLBACK_PROJECT_ID?.trim();
     const normalizedFromEnv = normalizeProjectId(fromEnv);
     if (normalizedFromEnv) {

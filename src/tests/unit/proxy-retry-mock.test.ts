@@ -8,6 +8,10 @@ const mockTokenManager = {
   getNextToken: vi.fn(),
   markAsRateLimited: vi.fn(),
   markAsForbidden: vi.fn(),
+  markFromUpstreamError: vi.fn(),
+  recordParityError: vi.fn(),
+  getModelOutputLimitForAccount: vi.fn(),
+  getModelThinkingBudgetForAccount: vi.fn(),
 };
 const mockGeminiClient = { streamGenerateInternal: vi.fn(), generateInternal: vi.fn() };
 
@@ -27,7 +31,7 @@ class TestableProxyService extends ProxyService {
   }
 
   public testModelHeaders(model: string): Record<string, string> {
-    return (this as any).buildModelSpecificHeaders(model);
+    return (this as any).createModelSpecificHeaders(model);
   }
 }
 
@@ -54,7 +58,7 @@ describe('ProxyService Empty Stream Retry Logic', () => {
 
   it('classifies retry matrix consistently', () => {
     const service = new TestableProxyService();
-    const classify = (message: string) => (service as any).classifyUpstreamError(message);
+    const classify = (message: string) => (service as any).classifyUpstreamFailure(message);
 
     expect(classify('401 unauthorized token')).toEqual({
       retry: true,
@@ -399,6 +403,22 @@ describe('ProxyService Empty Stream Retry Logic', () => {
 
     const internalPayload = mockGeminiClient.generateInternal.mock.calls[0][0];
     expect(internalPayload).not.toHaveProperty('sessionId');
+  });
+
+  it('normalizes Gemini 3.1 preview alias to Gemini 3.1 Pro High for upstream', async () => {
+    const service = new TestableProxyService();
+    mockTokenManager.getNextToken.mockResolvedValue(createToken('acc-1'));
+    mockGeminiClient.generateInternal.mockResolvedValue({
+      candidates: [{ content: { parts: [{ text: 'ok' }] }, finishReason: 'STOP' }],
+      usageMetadata: { totalTokenCount: 5 },
+    });
+
+    await service.handleGeminiGenerateContent('models/gemini-3.1-pro-preview', {
+      contents: [{ role: 'user', parts: [{ text: 'hello' }] }],
+    } as any);
+
+    const internalPayload = mockGeminiClient.generateInternal.mock.calls[0][0];
+    expect(internalPayload.model).toBe('gemini-3.1-pro-high');
   });
 
   it('strips non-parity Gemini usage metadata fields', async () => {
